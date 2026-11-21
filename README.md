@@ -22,7 +22,7 @@ python tools/ref/generate.py
 
 Setup, configs, and the cached-decode check are in [tools/ref/README.md](tools/ref/README.md). The decoder behaviour the Rust side has to match, with transformers file and line references, is in [tools/ref/SEMANTICS.md](tools/ref/SEMANTICS.md).
 
-Generated weights and activations go to `artifacts/ref/` and are not committed. `python tools/ref/generate.py` reproduces them.
+Generated weights and activations go to `artifacts/ref/` and are not committed. `python tools/ref/generate.py` reproduces them. CI runs `cargo check` and the two micro configs; the tiny configs are local-only because the checkpoints are hundreds of megabytes.
 
 ## Crate
 

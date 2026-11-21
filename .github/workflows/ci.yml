@@ -1,0 +1,36 @@
+# Tiny configs are not run here. inkling2/tiny writes about 440 MiB of weights
+# and 140 MiB of activations; inkling2_loop/tiny writes about 530 MiB and 220 MiB.
+# Both download the tiny-random/inkling-2 tokenizer. The two micro configs are
+# the CI gate: they exercise both architectures, the sliding-window boundary,
+# the loop (including a later pass), clipping, and the 1e-6 cached-decode check.
+# Regenerate tiny locally with `python tools/ref/generate.py`.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check
+
+  reference-micro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/ref/requirements.txt
+      - name: Install the pinned CPU reference environment
+        run: python -m pip install -r tools/ref/requirements.txt
+      - name: Generate the micro references and check cached decode
+        run: python tools/ref/generate.py --only inkling2/micro inkling2_loop/micro

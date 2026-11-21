@@ -18,6 +18,10 @@ pip install -r tools/ref/requirements.txt
 
 Do not install `causal-conv1d` or the Hugging Face `kernels` package in this environment. Those replace the PyTorch convolutions the dump is measured against.
 
+## CI
+
+`.github/workflows/ci.yml` runs `cargo check` and the two micro configs only. The tiny checkpoints are hundreds of megabytes and also download a tokenizer; regenerate those locally. Micro still covers both architectures, the sliding-window boundary, a loop pass, clipping, and the 1e-6 cached-decode check.
+
 ## Generate
 
 ```bash
