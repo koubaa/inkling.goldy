@@ -1,0 +1,15 @@
+# CPU reference environment for the Inkling 2 text decoder.
+#
+# transformers 5.24.0 is commit eeee11099135592f1d03c2871fbd3d8132e5a4d7
+# (the v5.24.0 tag). That commit contains models/inkling2 and models/inkling2_loop.
+# generate.py refuses to run if the installed modeling sources do not match the
+# sha256 recorded in pin.json for that commit.
+#
+# Torch is the CPU wheel. Do not install causal-conv1d or the Hugging Face
+# kernels package: the reference must take the pure PyTorch convolution path.
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.15.0+cpu
+transformers==5.24.0
+safetensors==0.8.0
