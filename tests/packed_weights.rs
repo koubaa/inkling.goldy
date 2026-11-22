@@ -7,7 +7,7 @@
 use ammon::checkpoint::MappedCheckpoint;
 use ammon::gpu::create_runtime;
 use ammon::Linear;
-use goldy::{Nvfp4Experts, Runtime, Scheme, Tensor, TensorDType, TensorKernels, TensorShape};
+use goldy::{BlockScaled, Runtime, Scheme, Tensor, TensorDType, TensorKernels, TensorShape};
 use inkling_goldy::packed::{load_nvfp4, ExpertProj};
 use safetensors::tensor::{serialize, TensorView};
 use safetensors::Dtype;
@@ -73,16 +73,18 @@ fn interleaved_w13_matches_concatenated_dequant() {
     let mut scheme = Scheme::new(&ctx);
     kernels
         .recorder(&mut scheme)
-        .matmul_nvfp4_indexed_into(
+        .matmul_block_scaled_into(
             "w13",
-            Nvfp4Experts {
+            BlockScaled {
                 codes: weight.codes.view(),
                 scales: weight.scales.view(),
-                factors: weight.factors.view(),
-                ids: ids.view(),
-                slot: 0,
+                elems: goldy::ops::PackedElem::E2M1,
+                scale: goldy::ops::PackedScale::E4M3,
+                block: [1, 16],
+                global: Some(weight.factors.view()),
             },
             x.view(),
+            Some((ids.view(), 0)),
             out.view(),
         )
         .unwrap();
@@ -156,16 +158,18 @@ fn real_mini_layers_when_present() {
         let mut scheme = Scheme::new(&ctx);
         kernels
             .recorder(&mut scheme)
-            .matmul_nvfp4_indexed_into(
+            .matmul_block_scaled_into(
                 "real_w13",
-                Nvfp4Experts {
+                BlockScaled {
                     codes: weight.codes.view(),
                     scales: weight.scales.view(),
-                    factors: weight.factors.view(),
-                    ids: ids.view(),
-                    slot: 0,
+                    elems: goldy::ops::PackedElem::E2M1,
+                    scale: goldy::ops::PackedScale::E4M3,
+                    block: [1, 16],
+                    global: Some(weight.factors.view()),
                 },
                 x.view(),
+                Some((ids.view(), 0)),
                 out.view(),
             )
             .unwrap();

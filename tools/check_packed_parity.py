@@ -58,8 +58,47 @@ def dequant(codes, scales, amax, denom, dtype_model):
     return Interleave(dim=1).convert({"w": out}, ["w"], ["out"])["out"]
 
 
+# data_offset values from the Mini safetensors header. File offset is
+# 8 + header_len + data_offset. header_len for this shard is 148408.
+DATA0 = 8 + 148408
+LAYERS = {
+    0: dict(codes=9206310048, scales=3855426720, amax=516096, denom=516608),
+    10: dict(codes=10225525920, scales=3982828704, amax=519184, denom=519696),
+    19: dict(codes=14811997344, scales=4556137632, amax=533080, denom=533592),
+}
+WQ_OFF = 960511392
+SHARD = "https://huggingface.co/thinkingmachines/Inkling-2-Mini/resolve/main/model-00001-of-00001.safetensors"
+
+
+def fetch_range(url, start, length, path):
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{start + length - 1}"})
+    with urllib.request.urlopen(req, timeout=120) as response:
+        blob = response.read()
+    if len(blob) != length:
+        raise SystemExit(f"short read {path}: {len(blob)} != {length}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "wb").write(blob)
+
+
+def ensure_bins(root):
+    """Range-fetch expert 0 and four wq rows when the directory is empty."""
+    marker = os.path.join(root, "l0", "codes.bin")
+    if os.path.exists(marker):
+        return
+    for layer, off in LAYERS.items():
+        folder = os.path.join(root, f"l{layer}")
+        fetch_range(SHARD, DATA0 + off["codes"], 2304 * 1152, os.path.join(folder, "codes.bin"))
+        fetch_range(SHARD, DATA0 + off["scales"], 2304 * 144, os.path.join(folder, "scales.bin"))
+        fetch_range(SHARD, DATA0 + off["amax"], 4, os.path.join(folder, "amax.bin"))
+        fetch_range(SHARD, DATA0 + off["denom"], 4, os.path.join(folder, "denom.bin"))
+    fetch_range(SHARD, DATA0 + WQ_OFF, 4608 * 4, os.path.join(root, "wq_rows.bin"))
+
+
 def main():
     root = os.environ.get("INKLING_REAL_PACK", "/tmp/realpack")
+    ensure_bins(root)
     x = pattern(2304)
     rows = []
     for layer in (0, 10, 19):
