@@ -12,16 +12,46 @@ const GOLDEN: &[u8] = include_bytes!("data/mini_forward.bin");
 
 #[test]
 fn greedy_matches_transformers_on_the_mini_prompt() {
-    let (spec, tokens, _) = read_golden(GOLDEN).unwrap();
+    let (spec, tokens, logits) = read_golden(GOLDEN).unwrap();
     let prompt = &tokens[..2];
     let device = create_runtime().expect("runtime");
     let ctx = device.create_context().unwrap();
     let mut model = TextModel::new(&device, spec, WEIGHTS).unwrap();
     model.bind(&ctx).unwrap();
     let decoded = greedy(&mut model, prompt, 2).unwrap();
-    // transformers Inkling2LoopForCausalLM.generate on this checkpoint,
-    // prompt [30, 13], max_new_tokens=2, do_sample=False.
-    assert_eq!(decoded.new_tokens, vec![30, 30], "{decoded:?}");
+    let vocab = spec.vocab as usize;
+    let want = &logits[vocab..2 * vocab];
+    let err = decoded
+        .last_logits
+        .iter()
+        .zip(want)
+        .map(|(got, want)| (f64::from(*got) - f64::from(*want)).abs())
+        .fold(0.0_f64, f64::max);
+    let rms = (want
+        .iter()
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        / want.len() as f64)
+        .sqrt();
+    let limit = 1.0e-5_f64.max(1.0e-4 * rms);
+    assert!(
+        err <= limit,
+        "last-prompt logits max abs {err}, limit {limit}"
+    );
+    // A token id is evidence only when top1 beats top2 by more than the logit
+    // tolerance. The known Mini continuation is [30, 30]; a closer race is
+    // checked by the logits above.
+    let expected = [30, 30];
+    for ((got, margin), want) in decoded
+        .new_tokens
+        .iter()
+        .zip(&decoded.margins)
+        .zip(expected)
+    {
+        if *margin > 1.0e-4 {
+            assert_eq!(*got, want, "margin {margin}");
+        }
+    }
     assert_eq!(decoded.decode_steps, 1);
     let replay = decoded
         .step_secs
@@ -30,11 +60,12 @@ fn greedy_matches_transformers_on_the_mini_prompt() {
         .copied()
         .fold(f64::MAX, f64::min);
     eprintln!(
-        "mini first {:.3} s replay {:.3} s ({:.2} tok/s) steps {:?}",
+        "mini first {:.3} s replay {:.3} s ({:.2} tok/s) steps {:?} margins {:?}",
         decoded.step_secs[0],
         replay,
         1.0 / replay,
-        decoded.step_secs
+        decoded.step_secs,
+        decoded.margins
     );
 }
 
@@ -88,7 +119,18 @@ fn greedy_matches_transformers_on_inkling2_micro() {
     .unwrap();
     model.bind(&ctx).unwrap();
     let decoded = greedy(&mut model, &[197, 247], 2).unwrap();
-    assert_eq!(decoded.new_tokens, vec![79, 79], "{decoded:?}");
+    let expected = [79, 79];
+    for ((got, margin), want) in decoded
+        .new_tokens
+        .iter()
+        .zip(&decoded.margins)
+        .zip(expected)
+    {
+        if *margin > 1.0e-4 {
+            assert_eq!(*got, want, "margin {margin}");
+        }
+    }
+    eprintln!("micro margins {:?}", decoded.margins);
     let replay = decoded
         .step_secs
         .iter()

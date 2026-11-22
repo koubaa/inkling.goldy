@@ -99,6 +99,20 @@ pub struct TextModel {
     ops: TensorKernels,
 }
 
+impl ammon::AutoregressiveModel for TextModel {
+    fn vocab_size(&self) -> usize {
+        self.spec.vocab as usize
+    }
+
+    fn max_seq_len(&self) -> u32 {
+        self.spec.seq
+    }
+
+    fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>> {
+        TextModel::step(self, token, pos)
+    }
+}
+
 impl TextModel {
     pub fn new(runtime: &Runtime, spec: ForwardSpec, weights: &[u8]) -> Result<Self> {
         if spec.schedule.visits() == 0 || spec.seq == 0 {
@@ -340,12 +354,14 @@ impl TextModel {
             BufferKind::Scattered,
         )?;
         let mut upload = Scheme::new(ctx);
+        upload.set_automatic_fusion(true);
         let deposit = MemoryExchange::new(ctx).bind_deposit(
             &mut upload,
             ammon::kernels::DecodeStep::deposit_target(&step),
         )?;
 
         let mut embed = Scheme::new(ctx);
+        embed.set_automatic_fusion(true);
         self.embedder
             .record(&mut embed, self.embed_table.view(), &step, embed_raw.view())?;
         self.norm.record(
@@ -360,6 +376,7 @@ impl TextModel {
         for (index, visit) in order.iter().enumerate() {
             let n_blocks = blocks_before(schedule, visit.layer, visit.pass);
             let mut scheme = Scheme::new(ctx);
+            scheme.set_automatic_fusion(true);
             let (src, dst) = if src_is_h {
                 (h.view(), h2.view())
             } else {
@@ -390,19 +407,23 @@ impl TextModel {
         }
 
         let mut snap = Scheme::new(ctx);
+        snap.set_automatic_fusion(true);
         self.ops
             .recorder(&mut snap)
             .copy("snap_hidden", h.view(), h_snap.view())?;
         let mut restore = Scheme::new(ctx);
+        restore.set_automatic_fusion(true);
         self.ops
             .recorder(&mut restore)
             .copy("restore_hidden", h_snap.view(), h.view())?;
         let mut copy_exit = Scheme::new(ctx);
+        copy_exit.set_automatic_fusion(true);
         self.ops
             .recorder(&mut copy_exit)
             .copy("pass_exit", h.view(), exit.view())?;
 
         let mut copy_keys = Scheme::new(ctx);
+        copy_keys.set_automatic_fusion(true);
         for slot in 0..n_keys {
             let src = tape
                 .view()
@@ -413,6 +434,7 @@ impl TextModel {
         }
         let scale = (f64::from(hidden)).powf(-0.5) as f32;
         let mut messages = Scheme::new(ctx);
+        messages.set_automatic_fusion(true);
         for local in 0..n_loop {
             let queries = self
                 .message_query
@@ -437,6 +459,7 @@ impl TextModel {
 
         let n_final = blocks_before(schedule, schedule.layers, 0);
         let mut finish = Scheme::new(ctx);
+        finish.set_automatic_fusion(true);
         self.depth.mix(
             &mut finish,
             tape.view(),
@@ -584,6 +607,84 @@ fn query(
     shaped(runtime, &data, &[rows, hidden])
 }
 
+/// Read a flat or nested config object.
+///
+/// Each field is the last `"name": number` in the text, so a nested
+/// `text_config` overrides a top-level copy. Hugging Face aliases
+/// (`hidden_size`, `num_hidden_layers`, `num_attention_heads`,
+/// `num_key_value_heads`, `intermediate_size`, `num_local_experts`,
+/// `num_experts_per_tok`, `vocab_size`, `max_position_embeddings`,
+/// `sliding_window`, `rms_norm_eps`) are accepted beside the short names.
+pub fn spec_from_config(text: &str) -> Result<ForwardSpec> {
+    let number = |names: &[&str]| -> Result<f64> {
+        let mut found = None;
+        for name in names {
+            let mut rest = text;
+            let needle = format!("\"{name}\"");
+            while let Some(at) = rest.find(&needle) {
+                let after = &rest[at + needle.len()..];
+                let after = after.trim_start();
+                let Some(after) = after.strip_prefix(':') else {
+                    rest = &rest[at + needle.len()..];
+                    continue;
+                };
+                let after = after.trim_start();
+                let end = after
+                    .find(|ch: char| {
+                        !(ch.is_ascii_digit() || matches!(ch, '-' | '+' | '.' | 'e' | 'E'))
+                    })
+                    .unwrap_or(after.len());
+                if let Ok(value) = after[..end].parse::<f64>() {
+                    found = Some(value);
+                }
+                rest = &rest[at + needle.len()..];
+            }
+        }
+        found.with_context(|| format!("config is missing {}", names[0]))
+    };
+    let whole = |names: &[&str]| -> Result<u32> {
+        let value = number(names)?;
+        if value < 0.0 || value.fract() != 0.0 {
+            bail!("config {} is not a whole number ({value})", names[0]);
+        }
+        Ok(value as u32)
+    };
+    Ok(ForwardSpec {
+        schedule: LoopSchedule {
+            layers: whole(&["num_hidden_layers", "layers"])?,
+            block: whole(&["block"])?,
+            loop_start: whole(&["loop_start"])?,
+            loop_end: whole(&["loop_end"])?,
+            passes: whole(&["passes"])?,
+        },
+        hidden: whole(&["hidden_size", "hidden"])?,
+        q_heads: whole(&["num_attention_heads", "q_heads"])?,
+        kv_heads: whole(&["num_key_value_heads", "kv_heads"])?,
+        head_dim: whole(&["head_dim"])?,
+        d_rel: whole(&["d_rel"])?,
+        rel_extent: whole(&["rel_extent"])?,
+        window: whole(&["sliding_window", "window"])?,
+        conv_kernel: whole(&["conv_kernel"])?,
+        experts: whole(&["num_local_experts", "experts"])?,
+        top_k: whole(&["num_experts_per_tok", "top_k"])?,
+        intermediate: whole(&["intermediate_size", "intermediate"])?,
+        gate_rank: whole(&["gate_rank"])?,
+        vocab: whole(&["vocab_size", "vocab"])?,
+        seq: whole(&["max_position_embeddings", "seq"])?,
+        scalars: DecodeLayerScalars {
+            rms_eps: number(&["rms_norm_eps", "rms_eps"])? as f32,
+            qk_clip: number(&["qk_clip"])? as f32,
+            rel_clip: number(&["rel_clip"])? as f32,
+            route_scale: number(&["route_scale"])? as f32,
+            gate_cap: number(&["gate_cap"])? as f32,
+            up_cap: number(&["up_cap"])? as f32,
+            log_alpha: number(&["log_alpha"])? as f32,
+            log_floor: number(&["log_floor"])? as f32,
+        },
+        logit_cap: number(&["logit_cap"])? as f32,
+    })
+}
+
 /// Header, prompt tokens, and teacher-forced logits from `mini_forward.bin`.
 pub fn read_golden(bytes: &[u8]) -> Result<(ForwardSpec, Vec<u32>, Vec<f32>)> {
     let mut at = 0usize;
@@ -673,4 +774,31 @@ fn bytes_f32(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spec_from_config;
+
+    #[test]
+    fn config_prefers_the_nested_copy() {
+        let text = r#"{
+            "hidden_size": 1,
+            "text_config": {
+                "num_hidden_layers": 12, "block": 6, "loop_start": 12, "loop_end": 12, "passes": 0,
+                "hidden_size": 64, "num_attention_heads": 4, "num_key_value_heads": 2,
+                "head_dim": 32, "d_rel": 8, "rel_extent": 16, "sliding_window": 8,
+                "conv_kernel": 4, "num_local_experts": 8, "num_experts_per_tok": 2,
+                "intermediate_size": 64, "gate_rank": 1, "vocab_size": 250,
+                "max_position_embeddings": 8, "rms_norm_eps": 1e-5, "qk_clip": 0.15,
+                "rel_clip": 0.35, "route_scale": 8, "gate_cap": 0.05, "up_cap": 0.05,
+                "log_alpha": 0.1, "log_floor": 4, "logit_cap": 0.05
+            }
+        }"#;
+        let spec = spec_from_config(text).unwrap();
+        assert_eq!(spec.hidden, 64);
+        assert_eq!(spec.schedule.layers, 12);
+        assert_eq!(spec.vocab, 250);
+        assert!((spec.scalars.rms_eps - 1e-5).abs() < 1e-8);
+    }
 }

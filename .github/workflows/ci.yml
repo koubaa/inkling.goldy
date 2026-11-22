@@ -10,7 +10,9 @@
 # Bump AMMON_REF / GOLDY_REF together. Ammon's own GOLDY_REF must be this
 # goldy pin. Goldy is main (1e85889, merge of #339). Ammon main does not
 # build against that goldy, so this PR pins the fusion branch, whose pin
-# matches.
+# matches. Each recorded scheme has automatic fusion on. One scheme for the
+# whole token does not submit on lavapipe: the 48-visit graph is thousands of
+# dispatches and the job does not finish.
 
 name: ci
 
@@ -20,7 +22,7 @@ on:
     branches: [main]
 
 env:
-  AMMON_REF: 145e2bbc0c8934a931aa64df89d35ce6b630f623
+  AMMON_REF: e6cfdae64845e98b64a83247003b57243bc78621
   GOLDY_REF: 1e85889a948784a1931b265e7a0cfaa8b4ea73bf
 
 jobs:

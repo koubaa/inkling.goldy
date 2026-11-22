@@ -6,9 +6,7 @@
 //! ties broken toward the lower index.
 
 use crate::model::TextModel;
-use ammon::sample_argmax;
-use anyhow::{ensure, Result};
-use std::time::Instant;
+use anyhow::Result;
 
 #[derive(Clone, Debug)]
 pub struct GreedyDecode {
@@ -22,6 +20,10 @@ pub struct GreedyDecode {
     pub decode_steps: u32,
     /// One entry per forward, prompt first. The first entry includes pipeline compile.
     pub step_secs: Vec<f64>,
+    /// `top1 - top2` at each new token.
+    pub margins: Vec<f32>,
+    /// Logits at the last prompt position.
+    pub last_logits: Vec<f32>,
 }
 
 impl GreedyDecode {
@@ -51,45 +53,18 @@ fn per_sec(count: f64, secs: f64) -> f64 {
 }
 
 /// Teacher-force `prompt`, then append `max_new` greedy tokens.
+///
+/// The loop lives in [`ammon::greedy_decode`].
 pub fn greedy(model: &mut TextModel, prompt: &[u32], max_new: u32) -> Result<GreedyDecode> {
-    ensure!(!prompt.is_empty(), "greedy decode needs a prompt token");
-    let mut step_secs = Vec::with_capacity(prompt.len() + max_new as usize);
-    let started = Instant::now();
-    let step_started = Instant::now();
-    let mut logits = model.step(prompt[0], 0)?;
-    step_secs.push(step_started.elapsed().as_secs_f64());
-    for (index, token) in prompt.iter().enumerate().skip(1) {
-        let step_started = Instant::now();
-        logits = model.step(*token, index as u32)?;
-        step_secs.push(step_started.elapsed().as_secs_f64());
-    }
-    let prefill_secs = started.elapsed().as_secs_f64();
-
-    let mut new_tokens = Vec::with_capacity(max_new as usize);
-    let mut pos = prompt.len() as u32;
-    let decode_started = Instant::now();
-    let mut decode_steps = 0u32;
-    for step in 0..max_new {
-        let next = sample_argmax(&logits);
-        ensure!(next >= 0, "argmax returned {next}");
-        let next = next as u32;
-        new_tokens.push(next);
-        if step + 1 == max_new {
-            break;
-        }
-        let step_started = Instant::now();
-        logits = model.step(next, pos)?;
-        step_secs.push(step_started.elapsed().as_secs_f64());
-        pos += 1;
-        decode_steps += 1;
-    }
-    let decode_secs = decode_started.elapsed().as_secs_f64();
+    let report = ammon::greedy_decode(model, prompt, max_new)?;
     Ok(GreedyDecode {
         prompt: prompt.to_vec(),
-        new_tokens,
-        prefill_secs,
-        decode_secs,
-        decode_steps,
-        step_secs,
+        new_tokens: report.new_tokens,
+        prefill_secs: report.prefill_secs,
+        decode_secs: report.decode_secs,
+        decode_steps: report.decode_steps,
+        step_secs: report.step_secs,
+        margins: report.margins,
+        last_logits: report.last_logits,
     })
 }

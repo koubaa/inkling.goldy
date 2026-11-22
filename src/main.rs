@@ -28,6 +28,7 @@ fn generate(mut args: impl Iterator<Item = String>) {
     {
         let mut weights = None;
         let mut header = None;
+        let mut config = None;
         let mut prompt = None;
         let mut max_new = 2u32;
         let mut tokenizer = None;
@@ -37,11 +38,19 @@ fn generate(mut args: impl Iterator<Item = String>) {
             match arg.as_str() {
                 "--weights" => weights = value,
                 "--header" => header = value,
+                "--config" => config = value,
                 "--prompt" => prompt = value,
                 "--text" => text = value,
                 "--tokenizer" => tokenizer = value,
                 "--max-new" => {
-                    max_new = value.as_deref().unwrap_or("2").parse().unwrap_or(2);
+                    let Some(raw) = value else {
+                        eprintln!("--max-new needs a number");
+                        std::process::exit(2);
+                    };
+                    max_new = raw.parse().unwrap_or_else(|_| {
+                        eprintln!("--max-new {raw} is not a whole number");
+                        std::process::exit(2);
+                    });
                 }
                 other => {
                     eprintln!("unknown argument {other}");
@@ -50,20 +59,39 @@ fn generate(mut args: impl Iterator<Item = String>) {
             }
         }
         let weights = weights.expect("--weights");
-        let header = header.expect("--header");
-        let bytes = std::fs::read(&weights).unwrap_or_else(|err| {
-            eprintln!("read {weights}: {err}");
+        let file = std::fs::File::open(&weights).unwrap_or_else(|err| {
+            eprintln!("open {weights}: {err}");
             std::process::exit(1);
         });
-        let header_bytes = std::fs::read(&header).unwrap_or_else(|err| {
-            eprintln!("read {header}: {err}");
+        let mapped = unsafe { memmap2::Mmap::map(&file) }.unwrap_or_else(|err| {
+            eprintln!("map {weights}: {err}");
             std::process::exit(1);
         });
-        let (spec, tokens, _) =
-            inkling_goldy::model::read_golden(&header_bytes).unwrap_or_else(|err| {
-                eprintln!("header: {err}");
+        let (spec, tokens) = if let Some(config) = config {
+            let text = std::fs::read_to_string(&config).unwrap_or_else(|err| {
+                eprintln!("read {config}: {err}");
                 std::process::exit(1);
             });
+            let spec = inkling_goldy::model::spec_from_config(&text).unwrap_or_else(|err| {
+                eprintln!("config: {err}");
+                std::process::exit(1);
+            });
+            (spec, Vec::new())
+        } else if let Some(header) = header {
+            let header_bytes = std::fs::read(&header).unwrap_or_else(|err| {
+                eprintln!("read {header}: {err}");
+                std::process::exit(1);
+            });
+            let (spec, tokens, _) = inkling_goldy::model::read_golden(&header_bytes)
+                .unwrap_or_else(|err| {
+                    eprintln!("header: {err}");
+                    std::process::exit(1);
+                });
+            (spec, tokens)
+        } else {
+            eprintln!("generate needs --config <config.json> or --header <mini_forward.bin>");
+            std::process::exit(2);
+        };
         let prompt_tokens = if let Some(text) = text {
             let path = tokenizer.unwrap_or_else(|| "assets/tokenizer.json".into());
             let tok =
@@ -86,7 +114,8 @@ fn generate(mut args: impl Iterator<Item = String>) {
         };
         let device = ammon::gpu::create_runtime().expect("runtime");
         let ctx = device.create_context().expect("context");
-        let mut model = inkling_goldy::model::TextModel::new(&device, spec, &bytes).expect("model");
+        let mut model =
+            inkling_goldy::model::TextModel::new(&device, spec, &mapped).expect("model");
         model.bind(&ctx).expect("bind");
         let decoded =
             inkling_goldy::generate::greedy(&mut model, &prompt_tokens, max_new).expect("greedy");
