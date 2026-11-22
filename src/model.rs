@@ -144,13 +144,17 @@ impl TextModel {
             &[spec.vocab, hidden],
         )?;
         let final_query = query(runtime, &file, "model.final_input.query", 1, hidden)?;
-        let message_query = query(
-            runtime,
-            &file,
-            "model.message_input.query",
-            spec.schedule.n_loop() * 4,
-            hidden,
-        )?;
+        let message_query = if spec.schedule.n_loop() == 0 {
+            zeros(runtime, &[1, hidden])?
+        } else {
+            query(
+                runtime,
+                &file,
+                "model.message_input.query",
+                spec.schedule.n_loop() * 4,
+                hidden,
+            )?
+        };
 
         let mut layers = Vec::new();
         let mut layer_weights = Vec::new();
@@ -275,12 +279,16 @@ impl TextModel {
         if order.len() != schedule.visits() as usize {
             bail!("visit list {} != {}", order.len(), schedule.visits());
         }
-        let end_len = blocks_before(schedule, schedule.loop_end, 0);
-        let key_start = message_key_start(schedule);
-        if end_len < key_start {
-            bail!("message key slice starts past the loop tape");
-        }
-        let n_keys = end_len - key_start;
+        let (n_keys, key_start) = if schedule.n_loop() == 0 {
+            (0, 0)
+        } else {
+            let end_len = blocks_before(schedule, schedule.loop_end, 0);
+            let key_start = message_key_start(schedule);
+            if end_len < key_start {
+                bail!("message key slice starts past the loop tape");
+            }
+            (end_len - key_start, key_start)
+        };
         let tape_rows = blocks_before(schedule, schedule.layers, 0).max(1);
         let cap = spec.seq.max(spec.window);
         let runtime = &self.runtime;
