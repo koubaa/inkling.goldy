@@ -1,0 +1,15 @@
+[package]
+name = "inkling-goldy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Inkling 2 text decoder on Ammon / Goldy. Python reference only so far."
+
+[lib]
+name = "inkling_goldy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inkling-goldy"
+path = "src/main.rs"
