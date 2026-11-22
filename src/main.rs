@@ -1,6 +1,7 @@
 fn main() {
+    let mini = inkling_goldy::tape::LoopSchedule::mini();
     println!(
-        "inkling.goldy reference harness: tools/ref (see tools/ref/README.md). \
-         The Rust decoder is not implemented yet."
+        "inkling.goldy: Inkling 2 decoder layer on Ammon. Mini schedule is {} visits (see tools/ref/README.md).",
+        mini.visits()
     );
 }

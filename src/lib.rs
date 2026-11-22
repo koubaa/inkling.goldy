@@ -1,9 +1,14 @@
-//! Inkling 2 and Inkling 2 Mini text decoders.
+//! Inkling 2 text decoder on Ammon and Goldy.
 //!
-//! The Python reference harness in `tools/ref` is the parity target: random
-//! FP32 weights, eager transformers forward, token-by-token decode. Ammon and
-//! Goldy are not linked yet. There is no vision tower and no multi-token
-//! prediction head.
+//! The Python harness in `tools/ref` is the parity target. This crate owns the
+//! checkpoint name map, the decoder layer, and the only depth-tape schedule.
+//! Ammon stays model-agnostic.
+
+pub mod names;
+pub mod tape;
+
+#[cfg(feature = "vulkan")]
+pub mod layer;
 
 /// Path of the reference harness, relative to the crate root.
 pub const REFERENCE_DIR: &str = "tools/ref";
