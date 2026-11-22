@@ -16,7 +16,7 @@ This tree currently holds the Python reference harness and a Rust crate skeleton
 ```bash
 python3 -m venv tools/ref/.venv
 source tools/ref/.venv/bin/activate
-pip install -r tools/ref/requirements.txt
+pip install -r tools/ref/requirements.lock
 python tools/ref/generate.py
 ```
 

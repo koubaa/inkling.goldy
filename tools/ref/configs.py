@@ -57,7 +57,6 @@ def _common_text(**overrides) -> dict:
     base = {
         "tie_word_embeddings": False,
         "attention_dropout": 0.0,
-        "rms_norm_eps": 1e-6,
         "conv_kernel_size": 4,
         "hidden_act": "silu",
         "scoring_func": "sigmoid",

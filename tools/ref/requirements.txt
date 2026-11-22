@@ -7,6 +7,9 @@
 #
 # Torch is the CPU wheel. Do not install causal-conv1d or the Hugging Face
 # kernels package: the reference must take the pure PyTorch convolution path.
+#
+# Direct pins are listed here. The full freeze, including Jinja2, is
+# requirements.lock. Install that file.
 
 --extra-index-url https://download.pytorch.org/whl/cpu
 

@@ -11,10 +11,10 @@ From the repository root:
 ```bash
 python3 -m venv tools/ref/.venv
 source tools/ref/.venv/bin/activate
-pip install -r tools/ref/requirements.txt
+pip install -r tools/ref/requirements.lock
 ```
 
-`requirements.txt` pins `torch==2.15.0+cpu` (the CPU index) and `transformers==5.24.0`. `generate.py` hashes the installed `modeling_inkling2.py` and `modeling_inkling2_loop.py` against [pin.json](pin.json) and stops if they are not the files from that commit.
+`requirements.lock` freezes the CPU environment, including `Jinja2==3.1.6` (a newer hub release rejects older Jinja and the tiny chat template then fails). `requirements.txt` lists the direct pins. `generate.py` hashes the installed `modeling_inkling2.py` and `modeling_inkling2_loop.py` against [pin.json](pin.json) and stops if they are not the files from that commit. The tiny tokenizer is `tiny-random/inkling-2` at revision `0a57c72e4e5b68aafe1d983dbb62980344a5fcd7`.
 
 Do not install `causal-conv1d` or the Hugging Face `kernels` package in this environment. Those replace the PyTorch convolutions the dump is measured against.
 

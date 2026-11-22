@@ -29,8 +29,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: tools/ref/requirements.txt
+          cache-dependency-path: tools/ref/requirements.lock
       - name: Install the pinned CPU reference environment
-        run: python -m pip install -r tools/ref/requirements.txt
+        run: python -m pip install -r tools/ref/requirements.lock
       - name: Generate the micro references and check cached decode
         run: python tools/ref/generate.py --only inkling2/micro inkling2_loop/micro
