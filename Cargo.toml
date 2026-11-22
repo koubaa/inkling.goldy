@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "Inkling 2 text decoder on Ammon / Goldy. Python reference only so far."
+description = "Inkling 2 text decoder on Ammon and Goldy."
 
 [lib]
 name = "inkling_goldy"
@@ -13,3 +13,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "inkling-goldy"
 path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+safetensors = "0.8"
+ammon = { path = "../ammon", default-features = false }
+goldy = { path = "../goldy", default-features = false, features = ["tensor"] }
+
+[features]
+default = []
+vulkan = ["ammon/vulkan", "goldy/vulkan"]

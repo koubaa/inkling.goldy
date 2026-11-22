@@ -9,7 +9,7 @@ Two architectures:
 
 Text only. No vision tower, no multi-token prediction.
 
-This tree currently holds the Python reference harness and a Rust crate skeleton. The Rust model is not implemented yet.
+This tree holds the Python reference harness and the Rust decoder layer: the checkpoint name map, one decoder layer, and the only depth-tape owner (`src/tape.rs`). Ammon supplies the model-agnostic kernels.
 
 ## Reference
 
@@ -22,12 +22,15 @@ python tools/ref/generate.py
 
 Setup, configs, and the cached-decode check are in [tools/ref/README.md](tools/ref/README.md). The decoder behaviour the Rust side has to match, with transformers file and line references, is in [tools/ref/SEMANTICS.md](tools/ref/SEMANTICS.md).
 
-Generated weights and activations go to `artifacts/ref/` and are not committed. `python tools/ref/generate.py` reproduces them. CI runs `cargo check` and the two micro configs; the tiny configs are local-only because the checkpoints are hundreds of megabytes.
+Generated weights and activations go to `artifacts/ref/` and are not committed. `python tools/ref/generate.py` reproduces them. CI runs `cargo check`, the lavapipe decoder-layer tests, and the two micro configs. The tiny configs are local-only because the checkpoints are hundreds of megabytes.
 
 ## Crate
 
+Ammon and Goldy are path dependencies, checked out as siblings of this crate. CI pins `AMMON_REF` and `GOLDY_REF`.
+
 ```bash
 cargo check
+cargo test --features vulkan -- --test-threads=1
 ```
 
-`inkling-goldy` does not link Ammon or Goldy yet. The binary prints a pointer at the harness.
+The Vulkan tests need lavapipe (`VK_DRIVER_FILES` pointing at `lvp_icd.json`). They replay a pinned sliding visit and a pinned full visit to 1e-5, including a retained resubmit, and check that two visit states do not share post-conv history.
