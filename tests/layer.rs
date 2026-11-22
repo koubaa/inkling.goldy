@@ -257,6 +257,22 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
             assert_eq!(recorded.executed_node_count(), 52, "{report:?}");
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let started = std::time::Instant::now();
+                let sub = recorded.submit().unwrap();
+                sub.wait_until_settled().unwrap();
+                samples.push(started.elapsed().as_secs_f64());
+            }
+            samples.sort_by(f64::total_cmp);
+            let median = samples[samples.len() / 2];
+            eprintln!(
+                "fusion-on full visit median {:.3} ms ({:.2} tok/s) over {} submits, executed {}",
+                median * 1.0e3,
+                1.0 / median,
+                samples.len(),
+                recorded.executed_node_count()
+            );
         }
         assert_eq!(stats.topology_records, 0, "{stats:?}");
         assert!(stats.clean_submits > 0, "{stats:?}");
