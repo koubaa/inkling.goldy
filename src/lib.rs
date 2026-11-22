@@ -9,6 +9,8 @@ pub mod tape;
 
 #[cfg(feature = "vulkan")]
 pub mod layer;
+#[cfg(feature = "vulkan")]
+pub mod model;
 
 /// Path of the reference harness, relative to the crate root.
 pub const REFERENCE_DIR: &str = "tools/ref";

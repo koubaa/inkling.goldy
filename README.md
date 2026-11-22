@@ -33,4 +33,4 @@ cargo check
 cargo test --features vulkan -- --test-threads=1
 ```
 
-The Vulkan tests need lavapipe (`VK_DRIVER_FILES` pointing at `lvp_icd.json`). They replay a pinned sliding visit and a pinned full visit to 1e-5, including a retained resubmit, and check that two visit states do not share post-conv history.
+The Vulkan tests need lavapipe (`VK_DRIVER_FILES` pointing at `lvp_icd.json`). They replay a pinned sliding visit and a pinned full visit to 1e-5, including a retained resubmit, and check that two visit states do not share post-conv history. `inkling2_loop/mini` is the 24-layer Mini schedule (48 visits) at a small width; `python tools/ref/generate.py --only inkling2_loop/mini` then `python tools/ref/pack_mini.py` refreshes the committed logits.
