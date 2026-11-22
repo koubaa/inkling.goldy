@@ -44,12 +44,12 @@ llama3.goldy is the pattern. It owns the checkpoint, the layer loop, and `set_au
 
 ## Goldy APIs this series adds
 
-`TensorRecorder::matmul_indexed_into(label, weight, x, ids, out, weight_stride_bytes)`:
+`TensorRecorder::matmul_indexed_into(label, weight, x, ids, slot, out) -> Tensor`:
 
-- `ids` is a 1-D `u32` tensor, not f32 bits.
-- Dispatch `slot` reads `ids[slot]` and adds `ids[slot] * weight_stride_bytes` to the weight base. Out-of-range ids do not read past the weight allocation.
-- Rank-1 `x` and a matrix row of `weight` lower through `MatMulDesc` the same way `matmul_into` does for a single expert. The Vulkan path is the matvec. CUDA uses the existing cuBLAS / tensor-core lowering when that desc is eligible; otherwise the same portable kernel `matmul_into` uses.
-- A test records two experts, sets the id buffer to expert 1, and matches a direct `matmul_into` of that slice. A second submit with a different id does not reuse the first expert's output.
+- `weight` is a packed `[experts, rows, k]` tensor. `ids` is a rank-1 `u32` tensor. `slot` selects which id this dispatch reads.
+- The implementation copies `weight[ids[slot]]` on device into the returned slab, then calls `matmul_into` on that slab. An id `>= experts` copies zeros and does not read past `weight`. The caller keeps the returned slab alive for every submit.
+- The multiply is the ordinary matmul lowering: Vulkan matvec, and cuBLAS / tensor cores when that desc is eligible. The id itself stays a device buffer, so a replay that rewrites `ids` selects a different expert without re-recording.
+- A test records two experts, sets the id to expert 1, and matches that slice times `x`. A second submit with a different id matches the other expert. An out-of-range id yields zeros.
 
 No new elementwise opcode is required for the FP32 formulas:
 
