@@ -419,15 +419,15 @@ fn two_visit_states_do_not_share_post_conv_history() {
         .bind_deposit(&mut right_up, DecodeStep::deposit_target(&right_step))
         .unwrap();
     let run = |scheme: &mut Scheme,
-                   upload: &mut Scheme,
-                   dep: &goldy::DepositTransaction,
-                   state: &DecodeLayerState,
-                   x: &Tensor,
-                   msg: &Tensor,
-                   out: &Tensor,
-                   token: &[f32],
-                   message: &[f32],
-                   pos: u32| {
+               upload: &mut Scheme,
+               dep: &goldy::DepositTransaction,
+               state: &DecodeLayerState,
+               x: &Tensor,
+               msg: &Tensor,
+               out: &Tensor,
+               token: &[f32],
+               message: &[f32],
+               pos: u32| {
         x.buffer().write(0, bytemuck::cast_slice(token)).unwrap();
         msg.buffer()
             .write(0, bytemuck::cast_slice(message))

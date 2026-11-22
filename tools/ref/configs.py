@@ -301,6 +301,53 @@ _add(
 )
 
 
+_add(
+    Spec(
+        family="inkling2_loop",
+        size="mini",
+        seq_len=4,
+        weight_seed=5000,
+        token_seed=5011,
+        use_tokenizer=False,
+        weight_std=0.2,
+        clip_scale_multiplier=20.0,
+        notes=(
+            "Mini's visit grid at a lavapipe width: 24 physical layers, layers "
+            "[6, 18) run three times (48 visits), then the post-loop block. "
+            "Hidden 32, 4/2 heads of 8, 4 experts choose 2, unpadded vocab 32. Sequence "
+            "length 4 crosses log_scaling_n_floor 2. The Rust forward compares "
+            "softcapped logits to tests/data/mini_forward.bin."
+        ),
+        hf=_common_text(
+            hidden_size=32,
+            num_hidden_layers=24,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            swa_num_attention_heads=4,
+            swa_num_key_value_heads=2,
+            swa_head_dim=8,
+            sliding_window_size=4,
+            d_rel=4,
+            rel_extent=8,
+            log_scaling_n_floor=2,
+            vocab_size=64,
+            unpadded_vocab_size=32,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            eos_token_id=1,
+            loop_layer_index_start=6,
+            loop_layer_index_end=18,
+            loop_num_passes=3,
+            loop_gate_rank=8,
+            qk_l2_clip_threshold=0.3,
+            rel_l2_clip_threshold=0.25,
+        ),
+    )
+)
+
+
 # Fixed chat prompt for the tiny configs. The tokenizer is tiny-random/inkling-2.
 TINY_PROMPT = "Explain in one sentence why the sky is usually blue."
 TOKENIZER_REPO = "tiny-random/inkling-2"

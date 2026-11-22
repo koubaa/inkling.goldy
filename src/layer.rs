@@ -363,9 +363,9 @@ impl DecodeLayer {
                 "decoder layer block tape is shorter than the boundary append".into(),
             ));
         }
-        if self.spec.messages != messages.is_some() {
+        if messages.is_some() && !self.spec.messages {
             return Err(GoldyError::Validation(
-                "decoder layer messages do not match the checkpoint".into(),
+                "decoder layer has no message gates for this visit".into(),
             ));
         }
         self.prepare_attention_streams(scheme, hidden, blocks, n_blocks, messages, weights)?;
@@ -413,7 +413,8 @@ impl DecodeLayer {
             })?;
             self.record_gate(scheme, mixed, msgs[3], gate, self.mlp.view())?;
         }
-        let mlp_src = if self.spec.messages {
+        // Pass 0 of a loop layer owns the gates and does not run them.
+        let mlp_src = if messages.is_some() {
             self.mlp.view()
         } else {
             mixed
