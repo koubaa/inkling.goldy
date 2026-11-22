@@ -52,6 +52,11 @@ pub fn expert_name(layer: u32, proj: ExpertProj, suffix: &str) -> String {
 ///
 /// This is `Interleave(dim=1)` from transformers `core_model_loading.py`: reshape
 /// `[experts, rows/2, 2, row]`, transpose the pair axis, and reshape back.
+///
+/// The permute stays on the host, over the packed bytes. Goldy's elementwise
+/// kernels index `src[i]` densely and do not honor a stride, so a stride-2
+/// view of the stored pairs would read the wrong bytes. A strided elementwise
+/// op would be a new kernel, not a view.
 pub fn deinterleave_dim1(
     src: &[u8],
     experts: usize,
