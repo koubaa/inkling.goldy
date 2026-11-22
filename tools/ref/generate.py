@@ -44,9 +44,14 @@ REF_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REF_DIR))
 
 from capture import SITE_DOCS, ActivationDump, install_hooks  # noqa: E402
-from configs import SPECS, TINY_PROMPT, TOKENIZER_REPO, Spec  # noqa: E402
+from configs import SPECS, TINY_PROMPT, TOKENIZER_REPO, TOKENIZER_REVISION, Spec  # noqa: E402
 
 PARITY_ATOL = 1e-6
+# Ammon-style comparisons use about 1e-5 absolute. A softcap that moves values
+# by less than that is invisible. The reference requires a much larger bend.
+SOFTCAP_MIN_DEVIATION = 1e-2
+# Below this, fp32 GPU noise can flip the k-th expert.
+ROUTER_MIN_MARGIN = 1e-4
 
 
 def main() -> None:
@@ -115,36 +120,55 @@ def verify_pin() -> dict:
 
 def generate_one(spec: Spec, out_root: Path, pin: dict) -> dict:
     model, config = build_model(spec)
-    rerandomize(model, seed=spec.weight_seed, std=spec.weight_std, clip_scale_multiplier=spec.clip_scale_multiplier)
+    rerandomize(
+        model,
+        seed=spec.weight_seed,
+        std=spec.weight_std,
+        clip_scale_multiplier=spec.clip_scale_multiplier,
+        bias_scale=spec.bias_scale,
+    )
     assert_not_left_at_hf_init(model)
 
     out_dir = out_root / spec.family / spec.size
     out_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(out_dir, safe_serialization=True)
-    check_config_roundtrip(spec, out_dir)
-
     input_ids, token_meta = make_tokens(spec)
     (out_dir / "input_ids.json").write_text(
         json.dumps({"input_ids": input_ids[0].tolist(), **token_meta}, indent=2) + "\n"
     )
 
-    dump = ActivationDump(spec.seq_len)
     start = spec.hf.get("loop_layer_index_start")
     end = spec.hf.get("loop_layer_index_end")
     num_loop = 0 if start is None else int(end) - int(start)
-    install_hooks(model, dump, loop_start=start, num_loop_layers=num_loop)
-
-    with torch.inference_mode():
-        full = model(input_ids=input_ids, use_cache=False)
-    dump.save("logits", full.logits, kind="bth")
-    check_sites(spec, dump)
-    check_masks_and_bias(spec, dump)
-    check_log_scale(spec, dump)
-    check_clipping(dump)
-    if num_loop:
-        check_message_gates_feed_norms(dump, start, end)
-
+    dump = None
+    full = None
+    for attempt in range(8):
+        if dump is not None:
+            dump.close()
+        dump = ActivationDump(spec.seq_len)
+        install_hooks(model, dump, loop_start=start, num_loop_layers=num_loop)
+        with torch.inference_mode():
+            full = model(input_ids=input_ids, use_cache=False)
+        dump.save("logits", full.logits, kind="bth")
+        check_sites(spec, dump)
+        check_masks_and_bias(spec, dump)
+        check_log_scale(spec, dump)
+        check_clipping(dump)
+        check_softcaps(dump)
+        if num_loop:
+            check_message_gates_feed_norms(dump, start, end, int(spec.hf["n_layers_per_attn_res_block"]))
+        try:
+            check_router_margin(dump)
+            break
+        except RuntimeError:
+            if attempt == 7 or not separate_router_ties(model, dump):
+                raise
+            print(f"router margin {dump.router_margin:.3e}; separating ties and rerunning", flush=True)
     dump.close()
+
+    model.save_pretrained(out_dir, safe_serialization=True)
+    save_transformers_state(model, out_dir / "model.transformers.safetensors")
+    assert_checkpoint_layout(model, out_dir / "model.safetensors")
+    check_config_roundtrip(spec, out_dir)
     with torch.inference_mode():
         decoded = cached_decode(model, input_ids)
     parity = compare_logits(full.logits[0], decoded)
@@ -152,7 +176,12 @@ def generate_one(spec: Spec, out_root: Path, pin: dict) -> dict:
     from safetensors.torch import save_file
 
     save_file(dump.tensors, str(out_dir / "activations.safetensors"))
-    manifest = build_manifest(spec, config, model, dump, token_meta, input_ids[0].tolist(), parity, pin)
+    digests = {
+        "model.safetensors": sha256_file(out_dir / "model.safetensors"),
+        "model.transformers.safetensors": sha256_file(out_dir / "model.transformers.safetensors"),
+        "activations.safetensors": sha256_file(out_dir / "activations.safetensors"),
+    }
+    manifest = build_manifest(spec, config, model, dump, token_meta, input_ids[0].tolist(), parity, pin, digests)
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     sizes = {
@@ -211,7 +240,7 @@ def build_model(spec: Spec):
     return model, config
 
 
-def rerandomize(model, *, seed: int, std: float, clip_scale_multiplier: float) -> None:
+def rerandomize(model, *, seed: int, std: float, clip_scale_multiplier: float, bias_scale: float) -> None:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     for parameter in model.parameters():
@@ -219,13 +248,116 @@ def rerandomize(model, *, seed: int, std: float, clip_scale_multiplier: float) -
     for buffer in model.buffers():
         if buffer.is_floating_point() and buffer.numel() > 0:
             buffer.normal_(mean=0.0, std=std, generator=generator)
+    # Widen router-bias gaps so the k-th and (k+1)-th corrected scores stay
+    # apart by more than fp32 GPU noise. Scores themselves stay O(1).
+    for name, buffer in model.named_buffers():
+        if name.endswith("e_score_correction_bias"):
+            buffer.mul_(bias_scale)
     scaled = 0
     for name, parameter in model.named_parameters():
-        if name.endswith(".scale"):
-            parameter.data.mul_(clip_scale_multiplier)
-            scaled += 1
+        if not name.endswith(".scale") or parameter.ndim != 2:
+            continue
+        # Even heads are scaled up into the clip. Odd heads stay near the
+        # Gaussian draw, under the threshold. Both branches have to run.
+        factors = torch.ones(parameter.shape[0], dtype=parameter.dtype)
+        factors[0::2] = clip_scale_multiplier
+        factors[1::2] = 0.05
+        parameter.data.mul_(factors[:, None])
+        scaled += 1
     if scaled == 0:
         raise RuntimeError("no clip scale parameters were found")
+
+
+def save_transformers_state(model, path: Path) -> None:
+    from safetensors.torch import save_file
+
+    state = {name: tensor.detach().cpu().contiguous() for name, tensor in model.state_dict().items()}
+    save_file(state, str(path))
+
+
+def _interleave_gate_up(gate_up: torch.Tensor) -> torch.Tensor:
+    """Inverse of transformers `Interleave(dim=1)`: concatenated [gate | up] to (gate, up) pairs."""
+    experts, fused, hidden = gate_up.shape
+    paired = gate_up.reshape(experts, 2, fused // 2, hidden).transpose(1, 2)
+    return paired.reshape(experts, fused, hidden).contiguous()
+
+
+def assert_checkpoint_layout(model, path: Path) -> None:
+    """`save_pretrained` writes Thinking Machines names, not `state_dict` names.
+
+    The module tensors are concatenated `[gate | up]`. The checkpoint `w13_weight`
+    is interleaved. A loader that `chunk(2)`s the checkpoint file swaps gate and up.
+    """
+    from safetensors.torch import load_file
+
+    checkpoint = load_file(str(path))
+    state = {name: tensor.detach().cpu().contiguous() for name, tensor in model.state_dict().items()}
+    bad = [key for key in checkpoint if "gate_up_proj" in key or "self_attn" in key or key.startswith("lm_head")]
+    if bad:
+        raise RuntimeError(f"checkpoint file contains transformers names: {bad[:4]}")
+    if not all(key.startswith("model.llm.") for key in checkpoint):
+        raise RuntimeError("checkpoint keys are not under model.llm.*")
+
+    for name, tensor in state.items():
+        if name.endswith("mlp.experts.gate_up_proj"):
+            layer = name.split("layers.")[1].split(".", 1)[0]
+            key = f"model.llm.layers.{layer}.mlp.experts.w13_weight"
+            interleaved = _interleave_gate_up(tensor)
+            if key not in checkpoint or not torch.equal(checkpoint[key], interleaved):
+                raise RuntimeError(f"{key} is not the interleaved gate/up of {name}")
+        elif name.endswith("mlp.experts.down_proj"):
+            layer = name.split("layers.")[1].split(".", 1)[0]
+            key = f"model.llm.layers.{layer}.mlp.experts.w2_weight"
+            if key not in checkpoint or not torch.equal(checkpoint[key], tensor):
+                raise RuntimeError(f"{key} does not match {name}")
+        elif name.endswith("attention_input.query"):
+            layer = int(name.split("layers.")[1].split(".", 1)[0])
+            key = f"model.llm.attn_res.attn_queries.{layer - 1}"
+            if key not in checkpoint or not torch.equal(checkpoint[key], tensor):
+                raise RuntimeError(f"{key} does not match {name} (index is offset by one)")
+        elif name.endswith("mlp_input.query"):
+            layer = name.split("layers.")[1].split(".", 1)[0]
+            key = f"model.llm.attn_res.mlp_queries.{layer}"
+            if key not in checkpoint or not torch.equal(checkpoint[key], tensor):
+                raise RuntimeError(f"{key} does not match {name}")
+
+    if "model.final_input.query" not in state:
+        raise RuntimeError("model has no final_input.query")
+    output_query = checkpoint.get("model.llm.attn_res.output_query")
+    if output_query is None or not torch.equal(output_query, state["model.final_input.query"]):
+        raise RuntimeError("attn_res.output_query does not match final_input.query")
+
+    head = state["lm_head.weight"]
+    unembed = checkpoint["model.llm.unembed.weight"]
+    vocab = int(model.config.vocab_size)
+    if unembed.shape[0] != vocab or head.shape[0] >= vocab:
+        raise RuntimeError(f"unembed {tuple(unembed.shape)} vs lm_head {tuple(head.shape)} vocab {vocab}")
+    if not torch.equal(unembed[: head.shape[0]], head):
+        raise RuntimeError("unembed prefix is not lm_head.weight")
+    if torch.count_nonzero(unembed[head.shape[0] :]) != 0:
+        raise RuntimeError("padded unembed rows are not zero")
+
+    if "model.message_input.query" in state:
+        query = state["model.message_input.query"]
+        queries = query[:, [0, 3]].flatten(0, 1).contiguous()
+        kv_queries = query[:, 1:3].flatten(0, 1).contiguous()
+        if not torch.equal(checkpoint["model.llm.middle_cycle_cross_pass_queries"], queries):
+            raise RuntimeError("middle_cycle_cross_pass_queries is not (query, mlp) per loop layer")
+        if not torch.equal(checkpoint["model.llm.middle_cycle_cross_pass_kv_queries"], kv_queries):
+            raise RuntimeError("middle_cycle_cross_pass_kv_queries is not (key, value) per loop layer")
+        sample = "model.layers.6.q_message_gate.down_proj.weight"
+        if sample in state:
+            got = checkpoint["model.llm.layers.6.controllers.attn.down_weight"]
+            if not torch.equal(got, state[sample]):
+                raise RuntimeError("controllers.attn is not q_message_gate")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def assert_not_left_at_hf_init(model) -> None:
@@ -274,7 +406,7 @@ def make_tokens(spec: Spec) -> tuple[torch.Tensor, dict]:
     if spec.use_tokenizer:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_REPO)
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_REPO, revision=TOKENIZER_REVISION)
         encoded = tokenizer.apply_chat_template(
             [{"role": "user", "content": TINY_PROMPT}],
             tokenize=True,
@@ -296,6 +428,7 @@ def make_tokens(spec: Spec) -> tuple[torch.Tensor, dict]:
         ids = tiled[: spec.seq_len]
         meta = {
             "tokenizer_repo": TOKENIZER_REPO,
+            "tokenizer_revision": TOKENIZER_REVISION,
             "prompt": TINY_PROMPT,
             "chat_template": True,
             "add_generation_prompt": True,
@@ -444,7 +577,7 @@ def check_masks_and_bias(spec: Spec, dump: ActivationDump) -> None:
 
     block = int(spec.hf["n_layers_per_attn_res_block"])
     first_full = block - 1
-    _assert_bias_support(dump, f"L0.rel_bias", distance, window)
+    _assert_bias_support(dump, "L0.rel_bias", distance, window)
     _assert_bias_support(dump, f"L{first_full}.rel_bias", distance, spec.rel_extent)
 
 
@@ -475,19 +608,79 @@ def check_log_scale(spec: Spec, dump: ActivationDump) -> None:
 
 def check_clipping(dump: ActivationDump) -> None:
     for kind in ("q", "k", "r"):
-        stats = dump.clip.get(kind)
-        if stats is None or stats["clipped"] <= 0:
-            raise RuntimeError(f"{kind} L2 clipping never fired ({dict(dump.clip)})")
+        for attention in ("sliding", "full"):
+            stats = dump.clip.get(f"{kind}.{attention}")
+            if stats is None or stats["total"] <= 0:
+                raise RuntimeError(f"no {kind} clip stats for {attention} layers ({dict(dump.clip)})")
+            if not 0 < stats["clipped"] < stats["total"]:
+                raise RuntimeError(
+                    f"{kind} {attention} clipping is {stats['clipped']}/{stats['total']}; "
+                    "both the clipped and the unclipped branch have to fire"
+                )
 
 
-def check_message_gates_feed_norms(dump: ActivationDump, start: int, end: int) -> None:
+def check_softcaps(dump: ActivationDump) -> None:
+    for kind in ("logit", "gate", "up"):
+        deviation = dump.softcap.get(kind, 0.0)
+        if deviation < SOFTCAP_MIN_DEVIATION:
+            raise RuntimeError(
+                f"{kind} softcap moves values by at most {deviation:.3e}, "
+                f"under {SOFTCAP_MIN_DEVIATION:.0e}; a missing softcap would still match"
+            )
+
+
+def check_router_margin(dump: ActivationDump) -> None:
+    if not dump.router_gaps:
+        raise RuntimeError("router recorded no scores")
+    margin = float(torch.cat([gap.reshape(-1) for gap in dump.router_gaps]).min().item())
+    dump.router_margin = margin
+    if margin < ROUTER_MIN_MARGIN:
+        raise RuntimeError(
+            f"minimum top-k score margin is {margin:.3e}, under {ROUTER_MIN_MARGIN:.0e}; "
+            "fp32 noise can flip the chosen experts"
+        )
+
+
+def separate_router_ties(model, dump: ActivationDump) -> bool:
+    """Push runner-up experts down until the recorded top-k gap clears the floor.
+
+    The correction bias only affects which experts are chosen, not their weights.
+    """
+    changed = False
+    for index, layer in enumerate(model.model.layers):
+        gate = layer.mlp.gate
+        prefixes = [f"L{index}."]
+        if getattr(layer, "_ref_is_loop", False):
+            passes = int(getattr(model.config, "loop_num_passes", 1))
+            prefixes = [f"L{index}.p{pass_idx}." for pass_idx in range(passes)]
+        for prefix in prefixes:
+            logits = dump.tensors.get(prefix + "router_logits")
+            if logits is None:
+                continue
+            bias = gate.e_score_correction_bias.detach().float().cpu()
+            corrected = torch.sigmoid(logits.float()) + bias
+            ranked_val, ranked_idx = corrected.sort(dim=-1, descending=True)
+            k = int(gate.top_k)
+            gap = ranked_val[:, k - 1] - ranked_val[:, k]
+            short = gap < ROUTER_MIN_MARGIN
+            if not bool(short.any()):
+                continue
+            losers = ranked_idx[short, k]
+            need = ROUTER_MIN_MARGIN - gap[short] + 1e-6
+            delta = torch.zeros_like(bias)
+            delta.scatter_reduce_(0, losers, need, reduce="amax")
+            gate.e_score_correction_bias.sub_(delta.to(gate.e_score_correction_bias.dtype))
+            changed = True
+    return changed
+
+
+def check_message_gates_feed_norms(dump: ActivationDump, start: int, end: int, block: int) -> None:
     """On passes after the first, each message-gate output is the matching norm input.
 
-    Sliding loop layers have one shared norm, called on the query, key and value
-    gate outputs in that order. Full loop layers have three norms. Both also
-    gate the MLP stream.
+    Sliding loop layers call the shared norm on the query, key and value gate
+    outputs in that order, so those land in attn_in_{q,k,v}. Full loop layers
+    have three norms. Both also gate the MLP stream.
     """
-    block = 6
     for index in range(int(start), int(end)):
         prefix = f"L{index}.p1."
         pairs = [
@@ -496,15 +689,15 @@ def check_message_gates_feed_norms(dump: ActivationDump, start: int, end: int) -
             ("msg_v", "attn_in_v"),
             ("msg_mlp", "mlp_in"),
         ]
-        if (index + 1) % block != 0 and f"{prefix}attn_in_q" not in dump.tensors:
-            pairs[0] = ("msg_q", "attn_in")
+        if (index + 1) % block == 0 and f"{prefix}attn_in_q" not in dump.tensors:
+            raise RuntimeError(f"{prefix}attn_in_q missing on a full loop layer")
         for left, right in pairs:
             diff = (dump.tensors[prefix + left] - dump.tensors[prefix + right]).abs().max().item()
             if diff != 0.0:
                 raise RuntimeError(f"{prefix}{left} and {prefix}{right} differ by {diff}")
 
 
-def build_manifest(spec, config, model, dump, token_meta, input_ids, parity, pin) -> dict:
+def build_manifest(spec, config, model, dump, token_meta, input_ids, parity, pin, digests) -> dict:
     layers = []
     for index, layer in enumerate(model.model.layers):
         layers.append(
@@ -553,6 +746,14 @@ def build_manifest(spec, config, model, dump, token_meta, input_ids, parity, pin
         "parameter_count": n_params,
         "layers": layers,
         "clip": {kind: dict(stats) for kind, stats in dump.clip.items()},
+        "softcap_max_abs_deviation": dump.softcap,
+        "router_min_margin": getattr(dump, "router_margin", None),
+        "expert_ids": "sorted ascending; weights follow that order. HF topk itself is sorted=False.",
+        "weights": {
+            "model.safetensors": "Thinking Machines checkpoint layout from save_pretrained (interleaved w13, padded unembed, model.llm.* names).",
+            "model.transformers.safetensors": "model.state_dict(). Concatenated [gate | up]. This is what chunk(2) expects.",
+        },
+        "sha256": digests,
         "parity": parity,
         "sites": sites,
         "model_class": type(model).__name__,

@@ -10,7 +10,7 @@ Attention is eager. SDPA, flash and flex are disabled on the text stack because 
 
 ## Layer pattern
 
-`layer_types[i]` is `"hybrid"` when `(i + 1) % n_layers_per_attn_res_block == 0`, otherwise `"hybrid_sliding"` (`configuration_inkling2.py` 172–176, same rule in the loop config). With the stock block size of 6 that is five sliding layers and one full layer, and the full layers are indices 5, 11, 17, 23, ...
+When `layer_types` is left unset, the config builds it with a **hard-coded** `(i + 1) % 6`, not `n_layers_per_attn_res_block` (`configuration_inkling2.py` 128–132, and the same lines in `configuration_inkling2_loop.py` 150–152). At the stock block size of 6 that is five sliding layers and one full layer, full layers at indices 5, 11, 17, 23, .... A different `n_layers_per_attn_res_block` does **not** change this pattern unless `layer_types` is passed explicitly. `is_block_boundary` does use `n_layers_per_attn_res_block` (`modeling_inkling2.py` 866).
 
 `"hybrid_sliding"` builds `Inkling2SlidingDecoderLayer` / the loop equivalent. `"hybrid"` builds the full-attention decoder layer. Sliding layers use `swa_*` head counts and `swa_head_dim`. Full layers use `num_attention_heads`, `num_key_value_heads` and `head_dim` (`modeling_inkling2.py` 554–560 and 647–653). In the released configs those two sets are equal; the micro and tiny configs here keep them equal too. Nothing requires `hidden_size == num_heads * head_dim`.
 
@@ -65,7 +65,7 @@ scores = (Q K^T) * head_dim**-0.5 + relative_bias + mask
 
 `repeat_kv` expands KV heads to query heads by repeating each KV head `num_query_heads / num_kv_heads` times (`modeling_inkling2.py` 503–512).
 
-**Sink.** `sink_proj` is a bias-free linear to `num_heads`, giving one logit per head per query (`modeling_inkling2.py` 622). That logit is concatenated on the key axis. Softmax runs over keys-plus-sink in fp32, and the sink column is dropped. The sink has no value vector; dropped mass is a zero contribution. There is always a sink (`modeling_inkling2.py` 536–539).
+**Sink.** `sink_proj` is a bias-free linear to `num_heads`, giving one logit per head per query (`modeling_inkling2.py` 622). It reads the **normed query stream**: for a sliding layer that is the shared `input_layernorm` output, and for a full layer it is `q_input_layernorm`'s output, not the key or value stream. `sink_proj` is called on the same `hidden_states` tensor as `q_proj` (`modeling_inkling2.py` 606–622 and 697–713). The logit is concatenated on the key axis. Softmax runs over keys-plus-sink in fp32, and the sink column is dropped. The sink has no value vector; dropped mass is a zero contribution. There is always a sink (`modeling_inkling2.py` 536–539).
 
 **Mask, full layers.** Causal, including the current token (`masking_utils.py` 74–78):
 
@@ -113,15 +113,16 @@ y = y * min(1, threshold / (||y||_2 + 1e-6))
 
 Queries and keys use `qk_l2_clip_threshold`. Relative states use `rel_l2_clip_threshold`. The clip fires when `||y|| + 1e-6 > threshold`. Values are not L2-clipped; they get an unweighted RMSNorm with `eps = rms_norm_eps` (`modeling_inkling2.py` 466–470).
 
-The published checkpoints use `qk_l2_clip_threshold = 22.627...` (`2 * sqrt(128)`) and `rel_l2_clip_threshold = 8`. The reference configs set both lower, each config to a value inside its own pre-clip norm distribution, so that at the weight scale that keeps cached decode inside 1e-6 of the full forward, Q, K and relative clipping all actually fire. The formula is unchanged; the thresholds are config values.
+The published checkpoints use `qk_l2_clip_threshold = 22.627...` (`2 * sqrt(128)`) and `rel_l2_clip_threshold = 8`. The reference configs set both lower, inside each config's pre-clip norm distribution. Even heads of each learned `scale` are then multiplied by `clip_scale_multiplier`, and odd heads by `0.05`, so some heads clip and some do not. The generator refuses a dump unless, for Q, K and relative states, and for both sliding and full layers, the clipped count is strictly between 0 and the number of vectors. The formula is unchanged; the thresholds are config values.
 
-Q, K and V projections are bias-free. The harness multiplies every learned `scale` by `clip_scale_multiplier` after the Gaussian redraw and refuses to continue if Q, K or relative clipping never fires on the dump sequence.
+Q, K and V projections are bias-free.
 
 **Short convolutions.** Kernel size is `conv_kernel_size` (alias `sconv_kernel_size`), stock 4. Four states per layer: K (`conv_idx 0`), V (`conv_idx 1`), post-attention (`conv_idx 2`), post-MLP (`conv_idx 3`). `number_of_conv_states = 4` is a class attribute, not a serialized field.
 
 Static convolution (sliding K/V, and both post-attention and post-MLP convolutions on every layer), `modeling_inkling2.py` 286–350:
 
 - Depthwise, bias-free, one kernel per channel. Causal via left padding of `kernel - 1` (the `F.conv1d` padding is symmetric; the implementation keeps the left-aligned `seq_len` outputs, 273–279).
+- Tap orientation is the opposite of the dynamic convolution. `conv1d.weight[c, 0, K - 1]` (the last kernel tap) multiplies the current token. `weight[c, 0, 0]` multiplies the token `K - 1` steps back.
 - Output is `(conv(x) + x) / sqrt(kernel + 1)`. For kernel 4 that is `/ sqrt(5)`.
 - The module is cast to fp32 at init (`modeling_inkling2.py` 464, 873–878).
 
@@ -141,13 +142,15 @@ Dynamic convolution (full-attention K and V only), `modeling_inkling2.py` 353–
 ```
 logits = x @ W^T                         # W is [n_experts, hidden], no bias parameter
 scores = sigmoid(logits)                 # scoring_func, stock "sigmoid"
-ids    = topk(scores + e_score_correction_bias, k, sorted=False)
+ids    = topk(scores + e_score_correction_bias, k, sorted=False)  # order is not a rank order
 weights = scores.gather(ids)             # bias does not enter the weights
 weights = weights / (weights.sum(-1, keepdim=True) + 1e-20)
 weights = weights * route_scale
 ```
 
-`e_score_correction_bias` is a buffer of zeros, not a parameter (`modeling_inkling2.py` 805, 1307). The harness redraws it. `route_scale` is the attribute behind the alias `routed_scaling_factor`. `n_routed_experts` is the attribute behind `num_local_experts`.
+`e_score_correction_bias` is a buffer of zeros, not a parameter (`modeling_inkling2.py` 805, 1307). The harness redraws it and, if a token's top-k gap is under `1e-4`, pushes the runner-up expert's bias down until every token clears that gap. That is wider than fp32 GPU noise, so an exact expert-id compare does not flake on a tie. The margin is recorded in the manifest. `route_scale` is the attribute behind the alias `routed_scaling_factor`. `n_routed_experts` is the attribute behind `num_local_experts`.
+
+`topk(..., sorted=False)` means the raw index order is not a rank order. The activation dump sorts `expert_ids` ascending and permutes `expert_weights` to match. Compare ids as a set, or in that sorted order with the paired weights.
 
 There is no shared expert in the module. The published `n_shared_experts: 0` is not a config field. The expert loop builds a one-hot of width `n_experts + 1` and skips the extra class (`modeling_inkling2.py` 775–780); top-k indices stay in `0 .. n_experts-1`.
 
@@ -160,7 +163,7 @@ softcap(z) = tanh(z / cap) * cap
 output = softcap(gate) * sigmoid(gate) * softcap(up)
 ```
 
-`mlp_gate_softcap` (stock 4) bounds only the linear gate factor. `sigmoid` sees the raw gate. `mlp_up_softcap` (stock 25) bounds `up`. The same softcap, with `final_logit_softcapping` (stock 30), bounds the logits.
+`mlp_gate_softcap` (stock 4) bounds only the linear gate factor. `sigmoid` sees the raw gate. `mlp_up_softcap` (stock 25) bounds `up`. The same softcap, with `final_logit_softcapping` (stock 30), bounds the logits. The reference configs set all three caps to `0.05`. At the stock caps and this weight scale the softcap is within about `1e-5` of the identity, so a missing softcap would pass a `1e-5` compare. The generator requires the max `|cap * tanh(x / cap) - x|` at the logit, gate and up sites to be at least `1e-2`.
 
 `moe_intermediate_size` is the attribute behind the alias `intermediate_size`.
 
@@ -172,9 +175,9 @@ Weighted RMSNorm (`modeling_inkling2.py` 101–115), used for the token embeddin
 y = x * rsqrt(mean(x^2) + eps) * weight
 ```
 
-Computed in fp32. `weight` is initialized to ones; the harness redraws it. `eps` is `rms_norm_eps` (stock `1e-6`).
+Computed in fp32. `weight` is initialized to ones; the harness redraws it from `Normal(0, weight_std)`, so it is centred at 0 rather than 1. `eps` is `rms_norm_eps`. The reference configs set that to `1e-5`. Stock checkpoints use `1e-6`.
 
-Unweighted RMSNorm drops `weight`. Depth-mix norms use the default `eps = 1e-6` regardless of `rms_norm_eps`. Value norms and the message-gate norms use `rms_norm_eps`.
+Unweighted RMSNorm drops `weight`. Depth-mix norms use the class default `eps = 1e-6` and do **not** read `rms_norm_eps`. Value norms and the message-gate norms use `rms_norm_eps` (`1e-5` here). A consumer that sends the depth mix through the weighted-norm eps, or the other way around, will not match.
 
 ## What HF init hides
 
@@ -187,7 +190,7 @@ Unweighted RMSNorm drops `weight`. Depth-mix norms use the default `eps = 1e-6` 
 | `e_score_correction_bias` | zeros |
 | attention-over-depth `query`, including the loop message queries | zeros |
 
-A zero message query is not a zero message: the depth-attention score is identically zero, so the softmax is uniform over the previous-pass blocks. A zero `static_weight` leaves only the dynamic taps. A ones `scale` with small projections often never reaches the clip threshold. The harness draws every parameter and every floating buffer from `Normal(0, weight_std)` with a per-config seed, then multiplies clip `scale` parameters by `clip_scale_multiplier`.
+A zero message query is not a zero message: the depth-attention score is identically zero, so the softmax is uniform over the previous-pass blocks. A zero `static_weight` leaves only the dynamic taps. A ones `scale` with small projections often never reaches the clip threshold. The harness draws every parameter and every floating buffer from `Normal(0, weight_std)` with a per-config seed, then spreads clip `scale` rows so even heads clip and odd heads do not.
 
 ## Loop (`inkling2_loop`)
 
@@ -242,7 +245,9 @@ Single-token decode uses `causal_conv1d_update` for the static convolution when 
 
 ## Checkpoint loading (not implemented)
 
-The published Mini (and Small) weights are not this harness's layout. `conversion_mapping.py` renames `model.llm.*` onto the text module. The names the Rust loader will eventually see in a raw Thinking Machines shard, and where they go:
+`save_pretrained` runs the reverse of this conversion, so `model.safetensors` **is** Thinking Machines layout: `model.llm.*` names, interleaved `w13_weight`, a zero-padded unembed, `attn_queries.{i}` belonging to layer `i + 1`, and (for the loop) split message queries. `model.transformers.safetensors` is `state_dict()`: concatenated `[gate | up]`, which is what `chunk(2)` expects. `generate.py` asserts the two files describe the same tensors, including `torch.equal` on the interleave. A loader that `chunk(2)`s `model.safetensors` silently swaps gate and up.
+
+The published Mini (and Small) shards use that same checkpoint layout, plus the quantization below. `conversion_mapping.py` renames `model.llm.*` onto the text module:
 
 | checkpoint | transformers parameter |
 | --- | --- |
@@ -273,5 +278,9 @@ Mini expert quantization (`hf_quant_config.json` on `thinkingmachines/Inkling-2-
 - The same op returns the tensor unchanged when only the weight is present (already dense). Small's MXFP8 path in `inkling2_text` keeps the scales as `*_scale_inv` and does **not** dequantize; the loop mapping replaces that with the dequant op (`conversion_mapping.py` 2654–2677). The dequant result is still run through `Interleave` for `w13`.
 - Other decoder tensors are bf16, except the attention-over-depth queries, the router bias and the two message-query matrices, which are fp32. `unembed` is stored bf16 and computed in fp32.
 - `mtp.safetensors` is a separate bf16 module. Out of scope, same as the vision tower (`model.visual.*`).
+
+## Comparing a Rust dump to these activations
+
+Most sites have RMS well below 1, often around `1e-2` or smaller. A fixed absolute tolerance of `1e-5` is loose next to a site that small, and it is also tight enough to miss a dropped softcap when the cap is the stock 30. Compare each site with something like `max(1e-5, 1e-4 * rms(site))`, and keep expert ids exact (they are sorted). The cached-versus-full check stays at `1e-6` absolute because both sides are the same graph.
 
 Published config keys that are not transformers fields: `q_bias`, `o_bias`, `pre_norm_pre_affine`, `final_norm_pre_affine`, `use_value_norm_no_gamma`, `attn_res_normalize_values`, `n_shared_experts`, `use_gate_bias`, `local_layer_ids`, and `loop_config.is_varloop`. The aliases that *are* honored are `sconv_kernel_size`, `intermediate_size`, `model_max_length`, `sliding_window`, `num_local_experts` and `routed_scaling_factor`.

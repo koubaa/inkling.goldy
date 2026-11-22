@@ -17,15 +17,18 @@ from transformers.models.inkling2.modeling_inkling2 import (
     Inkling2L2Clip,
     Inkling2LogScale,
     Inkling2ScaledL2Clip,
+    Inkling2Softcap,
 )
 from transformers.models.inkling2_loop.modeling_inkling2_loop import (
     Inkling2LoopL2Clip,
     Inkling2LoopLogScale,
     Inkling2LoopScaledL2Clip,
+    Inkling2LoopSoftcap,
 )
 
 CLIP_TYPES = (Inkling2L2Clip, Inkling2ScaledL2Clip, Inkling2LoopL2Clip, Inkling2LoopScaledL2Clip)
 LOG_SCALE_TYPES = (Inkling2LogScale, Inkling2LoopLogScale)
+SOFTCAP_TYPES = (Inkling2Softcap, Inkling2LoopSoftcap)
 
 SITE_DOCS = {
     "embed": "Token embedding after its RMSNorm. [T, hidden]",
@@ -53,7 +56,7 @@ SITE_DOCS = {
     "mlp_in": "MLP input after the depth mix and (on later loop passes) the message gate, before post_attention_layernorm. [T, hidden]",
     "mlp_norm": "post_attention_layernorm, the tensor that enters the router and experts. [T, hidden]",
     "router_logits": "Router linear outputs in fp32, before sigmoid. [T, n_experts]",
-    "expert_ids": "Top-k expert indices. Chosen by sigmoid(logits) + correction bias, sorted=False. [T, k]",
+    "expert_ids": "Top-k expert indices, sorted ascending. HF topk is sorted=False, so the raw order is not meaningful; the dump sorts ids and permutes expert_weights to match. Compare as a set, or in this sorted order. [T, k]",
     "expert_weights": "Renormalized sigmoid scores of the chosen experts, times route_scale. The bias is not part of the weight. [T, k]",
     "mlp_out": "Mixture-of-experts output before the post-MLP convolution. [T, hidden]",
     "post_mlp_conv": "Residual short convolution on the MLP output. [T, hidden]",
@@ -80,6 +83,9 @@ class ActivationDump:
         self.seq_len = seq_len
         self.tensors: dict[str, torch.Tensor] = {}
         self.clip = defaultdict(lambda: {"clipped": 0, "total": 0})
+        self.softcap: dict[str, float] = {}
+        self.router_gaps: list[torch.Tensor] = []
+        self.layer_attention: dict[int, str] = {}
         self._handles: list = []
         self._wrapped = []
 
@@ -161,10 +167,12 @@ def install_hooks(model: nn.Module, dump: ActivationDump, *, loop_start: int | N
     for index, layer in enumerate(layers):
         layer._ref_idx = index
         layer._ref_is_loop = loop_start <= index < loop_start + num_loop_layers if num_loop_layers else False
+        dump.layer_attention[index] = "sliding" if layer.attention_type == "sliding_attention" else "full"
         layer._ref_calls = 0
         layer._ref_pass = 0
         for module in layer.modules():
-            module._ref_layer = layer
+            # nn.Module.__setattr__ would register the layer as its own child.
+            module.__dict__["_ref_layer"] = layer
         layer._ref_shared_norm_in = []
         layer._ref_shared_norm_out = []
         dump._handles.append(layer.register_forward_pre_hook(pre_layer))
@@ -302,9 +310,18 @@ def _save_streams(dump: ActivationDump, module: nn.Module, stem: str, output) ->
 
 def _save_router(dump: ActivationDump, module: nn.Module, output) -> None:
     logits, weights, indices = output
+    indices = indices.to(torch.int64)
+    # HF topk is sorted=False. Sort by expert id so the dump has one order.
+    order = torch.argsort(indices, dim=-1)
+    indices = torch.gather(indices, -1, order)
+    weights = torch.gather(weights, -1, order)
+    corrected = torch.sigmoid(logits.detach().float()) + module.e_score_correction_bias.detach().float()
+    ranked = corrected.sort(dim=-1, descending=True).values
+    k = int(module.top_k)
+    dump.router_gaps.append((ranked[:, k - 1] - ranked[:, k]).detach().cpu())
     dump.save(_site(module, "router_logits"), logits, kind="flat")
     dump.save(_site(module, "expert_weights"), weights, kind="flat")
-    dump.save(_site(module, "expert_ids"), indices.to(torch.int64), kind="flat")
+    dump.save(_site(module, "expert_ids"), indices, kind="flat")
 
 
 def _mask_hook(dump: ActivationDump):
@@ -345,6 +362,8 @@ def _hook_clips(model: nn.Module, dump: ActivationDump) -> None:
     for name, module in model.named_modules():
         if isinstance(module, CLIP_TYPES):
             dump._handles.append(module.register_forward_hook(lambda mod, inputs, output, name=name: _count_clip(dump, name, mod, inputs)))
+        elif isinstance(module, SOFTCAP_TYPES):
+            dump._handles.append(module.register_forward_hook(lambda mod, inputs, output, name=name: _record_softcap(dump, name, mod, inputs)))
         elif isinstance(module, LOG_SCALE_TYPES) and "q_proj" in name and "log_scale" not in dump.tensors:
             dump._handles.append(module.register_forward_pre_hook(lambda mod, args: _save_log_scale(dump, mod, args)))
 
@@ -363,9 +382,26 @@ def _count_clip(dump: ActivationDump, name: str, module: nn.Module, inputs) -> N
         kind = "r"
     else:
         kind = "other"
-    bucket = dump.clip[kind]
+    layer_idx = int(name.split("layers.")[1].split(".", 1)[0])
+    attention = dump.layer_attention[layer_idx]
+    bucket = dump.clip[f"{kind}.{attention}"]
     bucket["clipped"] += int(clipped.sum().item())
     bucket["total"] += int(clipped.numel())
+
+
+def _record_softcap(dump: ActivationDump, name: str, module: nn.Module, inputs) -> None:
+    values = inputs[0].detach().float()
+    cap = float(module.softcap)
+    deviation = (cap * torch.tanh(values / cap) - values).abs().max().item()
+    if "logit_softcap" in name:
+        kind = "logit"
+    elif "gate_softcap" in name:
+        kind = "gate"
+    elif "up_softcap" in name:
+        kind = "up"
+    else:
+        kind = "other"
+    dump.softcap[kind] = max(dump.softcap.get(kind, 0.0), deviation)
 
 
 def _save_log_scale(dump: ActivationDump, module: nn.Module, args) -> None:

@@ -34,6 +34,7 @@ class Spec:
     hf: dict
     stock_windows: dict | None = None
     notes: str = ""
+    bias_scale: float = 4.0
 
     @property
     def name(self) -> str:
@@ -61,12 +62,18 @@ def _common_text(**overrides) -> dict:
         "hidden_act": "silu",
         "scoring_func": "sigmoid",
         "route_scale": 8.0,
-        "mlp_gate_softcap": 4.0,
-        "mlp_up_softcap": 25.0,
-        "final_logit_softcapping": 30.0,
+        # Stock caps are 4 / 25 / 30. At this weight scale those leave the
+        # softcap within 1e-5 of the identity, so a missing softcap would pass
+        # a 1e-5 check. These sit in the nonlinear region.
+        "mlp_gate_softcap": 0.05,
+        "mlp_up_softcap": 0.05,
+        "final_logit_softcapping": 0.05,
+        # Depth-mix unweighted norms stay at the class default 1e-6. This is
+        # different on purpose, so a consumer that uses the wrong eps fails.
+        "rms_norm_eps": 1e-5,
         # Tighter than the stock 22.627 / 8 so the clip is on the exercised path
         # at the reference weight scale. The formula is the stock one.
-        "qk_l2_clip_threshold": 0.2,
+        "qk_l2_clip_threshold": 0.15,
         "rel_l2_clip_threshold": 0.35,
         "log_scaling_alpha": 0.1,
         "n_layers_per_attn_res_block": 6,
@@ -136,6 +143,7 @@ _add(
         use_tokenizer=True,
         weight_std=0.05,
         clip_scale_multiplier=20.0,
+        bias_scale=50.0,
         notes=(
             "Widths match the ungated tiny-random/inkling-2 text config "
             "(hidden 128, 12 layers, 8/4 heads of 128, 96 experts choose 8, "
@@ -173,7 +181,7 @@ _add(
             eos_token_id=200006,
             # Head dim 128 at this weight scale; thresholds sit inside the
             # measured pre-clip norm distribution so some vectors clip.
-            qk_l2_clip_threshold=0.15,
+            qk_l2_clip_threshold=0.12,
             rel_l2_clip_threshold=0.10,
         ),
     )
@@ -233,6 +241,7 @@ _add(
         use_tokenizer=True,
         weight_std=0.05,
         clip_scale_multiplier=20.0,
+        bias_scale=50.0,
         notes=(
             "Inkling-2-Mini topology with a reduced hidden size: 24 physical "
             "layers, layers [6, 18) run three times, 24/8 heads, 128 experts "
@@ -286,7 +295,7 @@ _add(
             loop_layer_index_end=18,
             loop_num_passes=3,
             loop_gate_rank=32,
-            qk_l2_clip_threshold=0.08,
+            qk_l2_clip_threshold=0.055,
             rel_l2_clip_threshold=0.05,
         ),
     )
@@ -296,3 +305,6 @@ _add(
 # Fixed chat prompt for the tiny configs. The tokenizer is tiny-random/inkling-2.
 TINY_PROMPT = "Explain in one sentence why the sky is usually blue."
 TOKENIZER_REPO = "tiny-random/inkling-2"
+# Hub revision of tiny-random/inkling-2. A moving main branch would change the
+# chat-template token ids and every tiny fixture.
+TOKENIZER_REVISION = "0a57c72e4e5b68aafe1d983dbb62980344a5fcd7"

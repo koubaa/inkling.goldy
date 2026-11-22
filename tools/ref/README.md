@@ -40,10 +40,12 @@ Each run writes `artifacts/ref/<family>/<size>/`:
 
 | file | contents |
 | --- | --- |
-| `config.json`, `model.safetensors` | text causal LM. `model_type` is `inkling2_text` or `inkling2_loop_text`. |
-| `activations.safetensors` | one full-sequence forward. Keys `L{i}.{site}` or, on looped layers, `L{i}.p{pass}.{site}`. Shape `[T, ...]`, fp32 (expert ids are int64). |
-| `manifest.json` | site descriptions, layer table, clip counts, cached-decode comparison, token ids. |
-| `input_ids.json` | the token sequence. |
+| `config.json` | text causal LM config. `model_type` is `inkling2_text` or `inkling2_loop_text`. |
+| `model.safetensors` | `save_pretrained` output: Thinking Machines names (`model.llm.*`), interleaved `w13_weight`, zero-padded unembed. Do not `chunk(2)` this file. |
+| `model.transformers.safetensors` | `state_dict()`. Experts are concatenated `[gate \| up]`, which is what `chunk(2)` expects. |
+| `activations.safetensors` | one full-sequence forward. Keys `L{i}.{site}` or, on looped layers, `L{i}.p{pass}.{site}`. Shape `[T, ...]`, fp32. `expert_ids` are int64, sorted ascending, with `expert_weights` permuted to match. |
+| `manifest.json` | site descriptions, layer table, per-kind clip counts, softcap deviations, router margin, sha256 of the three safetensors files, token ids. |
+| `input_ids.json` | the token sequence. Tiny ids come from `tiny-random/inkling-2` at revision `0a57c72e4e5b68aafe1d983dbb62980344a5fcd7`. |
 
 `artifacts/` is gitignored. The two micro checkpoints are about 6–8 MiB each and the activations another 3–8 MiB; the tiny checkpoints are a few hundred MiB. Regeneration is the command above; weights and tokens are seeded.
 
@@ -55,21 +57,26 @@ transformers 5.24.0, CPU, eager, fp32. Cached decode versus the full forward, ma
 
 | config | weights | activations | max abs |
 | --- | --- | --- | --- |
-| `inkling2/micro` | 6,670,240 B | 3,334,688 B | 1.49e-7 |
-| `inkling2/tiny` | 459,359,248 B | 148,938,016 B | 1.19e-7 |
-| `inkling2_loop/micro` | 7,078,072 B | 8,173,368 B | 2.09e-7 |
-| `inkling2_loop/tiny` | 552,940,504 B | 226,762,224 B | 1.04e-7 |
+| `inkling2/micro` | 6,670,240 B | 3,334,688 B | 1.35e-7 |
+| `inkling2/tiny` | 459,359,248 B | 148,938,016 B | 8.20e-8 |
+| `inkling2_loop/micro` | 7,078,072 B | 8,173,368 B | 1.57e-7 |
+| `inkling2_loop/tiny` | 552,940,504 B | 226,762,224 B | 7.08e-8 |
 
-Q clipping fired on essentially every query vector. K clipping fired on 18–47% of key vectors and relative-state clipping on 48–97%, depending on the config. Thresholds are in each `config.json`; they are tighter than the stock 22.627 / 8 so the clip is on the path at this weight scale.
+For every config, Q, K and relative clipping each fire on some vectors and miss others, separately for sliding and full layers. Even clip-scale heads are multiplied by `clip_scale_multiplier` and odd heads by `0.05`. Gate, up and logit softcaps (all set to `0.05`, not the stock 4 / 25 / 30) each move their inputs by at least `0.1`. The minimum router top-k margin is at least `1e-4`. `rms_norm_eps` is `1e-5`; the depth-mix norm stays at its class default `1e-6`.
+
+Sites are small, often RMS around `1e-2`. Match a Rust dump with something like `max(1e-5, 1e-4 * rms(site))` rather than one absolute tolerance, and keep expert ids exact. The cached-versus-full check stays at `1e-6` absolute because both sides are the same graph.
 
 The process exits if any of these fail:
 
 - cached token-by-token decode differs from the full forward by more than `1e-6` absolute
-- Q, K, or relative-state L2 clipping never fires
+- for Q, K or relative states, on sliding or full layers, clipping fires on none of the vectors or on all of them
+- a softcap moves its input by less than `1e-2`
+- the minimum top-k score gap is under `1e-4`
 - the eager sliding mask is not `(query - window) < key <= query`, or the full mask is not `key <= query`
 - relative bias is nonzero outside its extent
+- `model.safetensors` is not the interleaved checkpoint layout of the transformers state dict
 
-Hugging Face init writes ones into clip scales and RMSNorm weights, and zeros into the dynamic-convolution `static_weight`, the router correction bias, and the attention-over-depth queries. After that init, every parameter and every floating buffer is redrawn from `Normal(0, weight_std)` and the clip scales are multiplied by `clip_scale_multiplier`. Both numbers are in the manifest.
+Hugging Face init writes ones into clip scales and RMSNorm weights, and zeros into the dynamic-convolution `static_weight`, the router correction bias, and the attention-over-depth queries. After that init, every parameter and every floating buffer is redrawn from `Normal(0, weight_std)`. Clip scales are then spread per head, as above.
 
 ## Configs
 
@@ -85,4 +92,4 @@ Field names are the transformers attributes (`conv_kernel_size`, `moe_intermedia
 
 ## What a later Mini load has to do
 
-Not done here. The raw `thinkingmachines/Inkling-2-Mini` shard uses different tensor names, an interleaved gate/up expert layout, NVFP4 experts in layers 0–19 and MXFP8 experts in layers 20–23, a padded unembedding, and a separate MTP file. SEMANTICS.md records the transformers conversion, including `Inkling2LoopDequantizeExperts`.
+`model.safetensors` is already in that checkpoint layout (interleaved gate/up, padded unembed, `model.llm.*` names). `model.transformers.safetensors` is the module `state_dict`. Quantization is not implemented: the real Mini shard stores NVFP4 experts in layers 0–19 and MXFP8 experts in layers 20–23, plus a separate MTP file. SEMANTICS.md records `Inkling2LoopDequantizeExperts`.
