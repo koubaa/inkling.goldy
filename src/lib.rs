@@ -5,6 +5,7 @@
 //! Ammon stays model-agnostic.
 
 pub mod names;
+pub mod packed;
 pub mod tape;
 pub mod tokenizer;
 

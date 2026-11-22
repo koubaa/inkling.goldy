@@ -38,6 +38,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "goldy",
+ "memmap2",
  "safetensors",
  "tokenizers",
 ]
