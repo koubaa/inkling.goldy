@@ -112,7 +112,7 @@ fn generate(mut args: impl Iterator<Item = String>) {
         } else {
             tokens.into_iter().take(2).collect()
         };
-        let device = ammon::gpu::create_runtime().expect("runtime");
+        let device = ammon::gpu::create_serial_runtime().expect("runtime");
         let ctx = device.create_context().expect("context");
         let mut model =
             inkling_goldy::model::TextModel::new(&device, spec, &mapped).expect("model");
