@@ -9,6 +9,8 @@
 # optional: the lavapipe job fails if the ICD is missing or is not Vulkan 1.4.
 # Goldy is main (8a79d75, merge of #341, which includes #340). Ammon is
 # checked out from its main branch, which carries the same goldy pin.
+# Retained command buffers keep their own frame-table rows, and a row holds
+# 32768 indices so one Mini token fits. One scheme per token, fusion on.
 
 name: ci
 

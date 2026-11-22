@@ -99,6 +99,9 @@ fn mini_forward_matches_the_reference_logits() {
     }
     assert_eq!(reader.at, reader.data.len());
 
+    // The predictor re-records every warmup step. Replay is about retained
+    // command buffers, so this test pins specialization off.
+    let _spec = goldy::test_support::SpecializationOverride::force_disabled();
     let device = create_runtime().expect("goldy runtime");
     let ctx = device.create_context().unwrap();
     let mut model = TextModel::new(&device, spec, WEIGHTS).unwrap();
@@ -119,6 +122,12 @@ fn mini_forward_matches_the_reference_logits() {
         err <= limit,
         "mini logits max abs {err}, limit {limit}, rms {rms}"
     );
+    let stats = model.replay_stats();
+    assert!(
+        stats.resubmit_hits > 0,
+        "token scheme did not replay: {stats:?}"
+    );
+    assert_eq!(stats.retained_evictions, 0, "{stats:?}");
 }
 
 fn max_abs(got: &[f32], want: &[f32]) -> f64 {
