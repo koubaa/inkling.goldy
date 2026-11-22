@@ -243,9 +243,10 @@ fn decoder_layer_matches_pinned_module_on_replay() {
         // docs/RESTRUCTURE.md asks a later sliding visit to execute 26+2K nodes.
         // On this micro visit (top-k 2) that budget is 30. Fusion does build one
         // semantic region per message-gate projection, per SwiGLU, and per RMS
-        // chain. The full visit promotes to 53 executed nodes: depth mix, the
-        // conv rings, split-K, and the tape store stay their own dispatches, and
-        // a message gate is two regions rather than one. The sliding visit's
+        // chain. The full visit promotes to 52 executed nodes: a unit softcap is
+        // one tanh, so each message gate joins its mix and the following RMS.
+        // Depth mix, the conv rings, split-K, and the tape store stay one
+        // dispatch each. The sliding visit's
         // pipelines were still compiling after this wait, so its executed count
         // stays the recorded graph; the region list is what the planner admitted.
         assert!(has("rms_normalize"), "no fused RMS region: {report:?}");
@@ -257,7 +258,7 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .iter()
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
-            assert_eq!(recorded.executed_node_count(), 53, "{report:?}");
+            assert_eq!(recorded.executed_node_count(), 52, "{report:?}");
         }
         assert_eq!(stats.topology_records, 0, "{stats:?}");
         assert!(stats.clean_submits > 0, "{stats:?}");
