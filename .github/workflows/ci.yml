@@ -8,7 +8,8 @@
 # The Rust crate path-depends on ammon and goldy as siblings. GPU tests are not
 # optional: the lavapipe job fails if the ICD is missing or is not Vulkan 1.4.
 # Bump AMMON_REF / GOLDY_REF together. Ammon's own GOLDY_REF must be this
-# goldy pin. Goldy is main (6aeaa153, merge of #338, matmul_indexed_into).
+# goldy pin. Ammon is main (3a7c77d, merge of #10). Goldy is main
+# (6aeaa153, merge of #338, matmul_indexed_into).
 
 name: ci
 
@@ -18,7 +19,7 @@ on:
     branches: [main]
 
 env:
-  AMMON_REF: b9d5985cfd4ad5740e9c72a9a154fcd432491d87
+  AMMON_REF: 3a7c77d353da1478c31a81f8407bb02e75436ddf
   GOLDY_REF: 6aeaa15355e7265e7f9a486410d7bf16e49a6c97
 
 jobs:
