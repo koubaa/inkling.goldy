@@ -241,14 +241,12 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .any(|region| region.labels.iter().any(|label| label.to_string() == name))
         };
         // docs/RESTRUCTURE.md asks a later sliding visit to execute 26+2K nodes.
-        // On this micro visit (top-k 2) that budget is 30. Fusion does build one
-        // semantic region per message-gate projection, per SwiGLU, and per RMS
-        // chain. The full visit promotes to 52 executed nodes: a unit softcap is
-        // one tanh, so each message gate joins its mix and the following RMS.
-        // Depth mix, the conv rings, split-K, and the tape store stay one
-        // dispatch each. The sliding visit's
-        // pipelines were still compiling after this wait, so its executed count
-        // stays the recorded graph; the region list is what the planner admitted.
+        // On this micro visit (top-k 2) that budget is 30. The full visit
+        // promotes to 52 executed nodes. A unit softcap is one tanh, so each
+        // message gate joins its mix and the following RMS. Depth mix, the conv
+        // rings, split-K, and the tape store stay one dispatch each. The sliding
+        // visit's pipelines were still compiling after this wait, so its
+        // executed count stays the recorded graph.
         assert!(has("rms_normalize"), "no fused RMS region: {report:?}");
         assert!(has("msg_forget_h"), "no fused message gate: {report:?}");
         assert!(has("swiglu"), "no fused SwiGLU: {report:?}");
