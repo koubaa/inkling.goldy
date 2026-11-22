@@ -576,6 +576,91 @@ fn query(
     shaped(runtime, &data, &[rows, hidden])
 }
 
+/// Header, prompt tokens, and teacher-forced logits from `mini_forward.bin`.
+pub fn read_golden(bytes: &[u8]) -> Result<(ForwardSpec, Vec<u32>, Vec<f32>)> {
+    let mut at = 0usize;
+    let u32_at = |at: &mut usize| -> Result<u32> {
+        let bytes = bytes
+            .get(*at..*at + 4)
+            .context("golden truncated")?
+            .try_into()
+            .unwrap();
+        *at += 4;
+        Ok(u32::from_le_bytes(bytes))
+    };
+    let f32_at = |at: &mut usize| -> Result<f32> {
+        let bytes = bytes
+            .get(*at..*at + 4)
+            .context("golden truncated")?
+            .try_into()
+            .unwrap();
+        *at += 4;
+        Ok(f32::from_le_bytes(bytes))
+    };
+    let magic = u32_at(&mut at)?;
+    if magic != 0x494E_4B4D {
+        bail!("golden magic {magic:#x}");
+    }
+    let version = u32_at(&mut at)?;
+    if version != 1 {
+        bail!("golden version {version}");
+    }
+    let hidden = u32_at(&mut at)?;
+    let layers = u32_at(&mut at)?;
+    let block = u32_at(&mut at)?;
+    let loop_start = u32_at(&mut at)?;
+    let loop_end = u32_at(&mut at)?;
+    let passes = u32_at(&mut at)?;
+    let mut spec = ForwardSpec {
+        schedule: LoopSchedule {
+            layers,
+            block,
+            loop_start,
+            loop_end,
+            passes,
+        },
+        hidden,
+        q_heads: u32_at(&mut at)?,
+        kv_heads: u32_at(&mut at)?,
+        head_dim: u32_at(&mut at)?,
+        d_rel: u32_at(&mut at)?,
+        rel_extent: u32_at(&mut at)?,
+        window: u32_at(&mut at)?,
+        conv_kernel: u32_at(&mut at)?,
+        experts: u32_at(&mut at)?,
+        top_k: u32_at(&mut at)?,
+        intermediate: u32_at(&mut at)?,
+        gate_rank: u32_at(&mut at)?,
+        vocab: u32_at(&mut at)?,
+        seq: u32_at(&mut at)?,
+        scalars: crate::layer::DecodeLayerScalars {
+            rms_eps: f32_at(&mut at)?,
+            qk_clip: f32_at(&mut at)?,
+            rel_clip: f32_at(&mut at)?,
+            route_scale: f32_at(&mut at)?,
+            gate_cap: f32_at(&mut at)?,
+            up_cap: f32_at(&mut at)?,
+            log_alpha: 0.0,
+            log_floor: 0.0,
+        },
+        logit_cap: f32_at(&mut at)?,
+    };
+    spec.scalars.log_alpha = f32_at(&mut at)?;
+    spec.scalars.log_floor = f32_at(&mut at)?;
+    let mut tokens = Vec::with_capacity(spec.seq as usize);
+    for _ in 0..spec.seq {
+        tokens.push(u32_at(&mut at)?);
+    }
+    let mut logits = Vec::with_capacity((spec.seq * spec.vocab) as usize);
+    for _ in 0..spec.seq * spec.vocab {
+        logits.push(f32_at(&mut at)?);
+    }
+    if at != bytes.len() {
+        bail!("golden has {} trailing bytes", bytes.len() - at);
+    }
+    Ok((spec, tokens, logits))
+}
+
 fn bytes_f32(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

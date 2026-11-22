@@ -46,12 +46,15 @@ jobs:
           path: goldy
 
       - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch the pinned Inkling tokenizer
+        working-directory: inkling
+        run: sh tools/fetch_tokenizer.sh
       - name: Check
         working-directory: inkling
         run: cargo check
       - name: Host tests
         working-directory: inkling
-        run: cargo test --lib
+        run: cargo test --lib --test tokenizer
 
   reference-micro:
     runs-on: ubuntu-latest
@@ -117,6 +120,10 @@ jobs:
           DISPLAY= vulkaninfo --summary | tee /tmp/vulkaninfo.txt
           grep -E 'apiVersion[[:space:]]+= 1\.4\.' /tmp/vulkaninfo.txt
           grep -Ei 'deviceName.*(llvmpipe|lavapipe)' /tmp/vulkaninfo.txt
+
+      - name: Fetch the pinned Inkling tokenizer
+        working-directory: inkling
+        run: sh tools/fetch_tokenizer.sh
 
       - name: Vulkan tests
         working-directory: inkling

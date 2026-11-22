@@ -6,7 +6,10 @@
 
 pub mod names;
 pub mod tape;
+pub mod tokenizer;
 
+#[cfg(feature = "vulkan")]
+pub mod generate;
 #[cfg(feature = "vulkan")]
 pub mod layer;
 #[cfg(feature = "vulkan")]
