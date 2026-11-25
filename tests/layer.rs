@@ -57,6 +57,34 @@ fn read_f32(scheme: &mut Scheme, buf: &goldy::Buffer) -> Vec<f32> {
     bytemuck::cast_slice(&bytes).to_vec()
 }
 
+/// Submit until every fusion region is promoted or has failed and no compile
+/// is still outstanding. A fixed iteration cap can observe the recorded graph
+/// while pipelines are still compiling; the steady executed-node count is the
+/// count after this returns.
+fn wait_until_fusion_settled(scheme: &mut Scheme) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let _ = scheme.submit().expect("submit while fusion settles");
+        let report = scheme.fusion_report();
+        let open = report
+            .regions
+            .iter()
+            .any(|region| matches!(region.status, goldy::FusionRegionStatus::Compiling));
+        if scheme.replay_stats().clean_submits > 0
+            && !scheme.compiles_pending()
+            && !open
+            && !report.regions.is_empty()
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fusion did not settle: {report:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 fn max_abs(got: &[f32], want: &[f32]) -> f64 {
     got.iter()
         .zip(want)
@@ -215,23 +243,7 @@ fn decoder_layer_matches_pinned_module_on_replay() {
             let err = max_abs(&got, want);
             assert!(err <= 1e-5, "case {case} token {pos} max abs {err}");
         }
-        for _ in 0..150 {
-            let stats = recorded.replay_stats();
-            let report = recorded.fusion_report();
-            let settling = report
-                .regions
-                .iter()
-                .any(|region| matches!(region.status, goldy::FusionRegionStatus::Compiling));
-            if stats.clean_submits > 0
-                && !recorded.compiles_pending()
-                && !settling
-                && !report.regions.is_empty()
-            {
-                break;
-            }
-            let _ = recorded.submit().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        wait_until_fusion_settled(&mut recorded);
         let stats = recorded.replay_stats();
         let report = recorded.fusion_report();
         let has = |name: &str| {
@@ -242,12 +254,13 @@ fn decoder_layer_matches_pinned_module_on_replay() {
         };
         // docs/RESTRUCTURE.md asks a later sliding visit to execute 26+2K nodes.
         // On this micro visit (top-k 2) that budget is 30. The full visit
-        // promotes to 44 executed nodes. The two gate RMS norms write straight
-        // into the concat rows, so the eight depth_store copies are gone. A
-        // unit softcap is one tanh. Depth mix, the conv rings, split-K, and
-        // the tape store stay one dispatch each. The sliding visit's pipelines
-        // were still compiling after this wait, so its executed count stays
-        // the recorded graph.
+        // promotes to 36 executed nodes on goldy main. #342 folds a short GEMV
+        // into the GEMV that consumes it, and #343 gives an in-range indexed
+        // GEMV a semantic site. Together those are eight dispatches fewer than
+        // the 44 this asserted before #342. The two gate RMS norms write
+        // straight into the concat rows, so the eight depth_store copies are
+        // gone. A unit softcap is one tanh. Depth mix, the conv rings, split-K,
+        // and the tape store stay one dispatch each.
         assert!(has("rms_normalize"), "no fused RMS region: {report:?}");
         assert!(has("msg_forget_h"), "no fused message gate: {report:?}");
         assert!(has("swiglu"), "no fused SwiGLU: {report:?}");
@@ -257,7 +270,7 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .iter()
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
-            assert_eq!(recorded.executed_node_count(), 44, "{report:?}");
+            assert_eq!(recorded.executed_node_count(), 36, "{report:?}");
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let started = std::time::Instant::now();
