@@ -9,7 +9,9 @@
 # optional: the lavapipe job fails if the ICD is missing or is not Vulkan 1.4.
 # Bump AMMON_REF / GOLDY_REF together. Ammon's own GOLDY_REF must be this
 # goldy pin. Goldy is main (8a79d75, merge of #341, which includes #340).
-# Ammon is main (8fa4c6d, merge of #12): packed BF16 and NVFP4 checkpoints.
+# Ammon main after #12 has the packed checkpoints but not the hf-tokenizer
+# feature this crate needs, so the pin is the fusion branch (52ad90d), which
+# is that main plus the tokenizer.
 
 name: ci
 
@@ -19,7 +21,7 @@ on:
     branches: [main]
 
 env:
-  AMMON_REF: 8fa4c6dc664de71f185ffdf8ea9bd53f86709e36
+  AMMON_REF: 52ad90d8fce372828465990dbb9559050c1c7b7f
   GOLDY_REF: 8a79d75d9b8969ce941201284e805e3ca170c4de
 
 jobs:
