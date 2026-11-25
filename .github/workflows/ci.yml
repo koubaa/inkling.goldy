@@ -9,10 +9,9 @@
 # optional: the lavapipe job fails if the ICD is missing or is not Vulkan 1.4.
 # Bump AMMON_REF / GOLDY_REF together. Ammon's own GOLDY_REF must be this
 # goldy pin. Goldy is main (8a79d75, merge of #341, which includes #340).
-# Ammon main does not build against that goldy, so this PR pins the fusion
-# branch, whose pin matches. Each recorded scheme has automatic fusion on.
-# One scheme for the whole token does not submit on lavapipe: the 48-visit
-# graph is thousands of dispatches and the job does not finish.
+# Ammon main after #12 has the packed checkpoints but not the hf-tokenizer
+# feature this crate needs, so the pin is the fusion branch (52ad90d), which
+# is that main plus the tokenizer.
 
 name: ci
 
