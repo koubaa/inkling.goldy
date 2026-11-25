@@ -7,8 +7,10 @@
 #
 # The Rust crate path-depends on ammon and goldy as siblings. GPU tests are not
 # optional: the lavapipe job fails if the ICD is missing or is not Vulkan 1.4.
-# Goldy is main (8a79d75, merge of #341, which includes #340). Ammon is
-# checked out from its main branch, which carries the same goldy pin.
+# Goldy is main (4cc362b, merge of #342). Ammon is checked out from its
+# main branch and built against this goldy. Ammon's own workflow still
+# names the previous pin; these sources compile and the decoder replay
+# matches against 4cc362b.
 # Retained command buffers keep their own frame-table rows, and a row holds
 # 32768 indices so one Mini token fits. One scheme per token, fusion on.
 
@@ -20,7 +22,7 @@ on:
     branches: [main]
 
 env:
-  GOLDY_REF: 8a79d75d9b8969ce941201284e805e3ca170c4de
+  GOLDY_REF: 4cc362bd2fc57810a924a2c92558421405fb2b59
 
 jobs:
   rust:
