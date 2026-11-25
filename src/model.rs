@@ -406,26 +406,21 @@ impl TextModel {
                 })?;
                 let message_query = self.message_query.view();
                 token.group(format!("messages-{pass}"), |scheme| {
-                    for local in 0..n_loop {
-                        let queries = message_query
-                            .narrow(0, local * 4, 4)?
-                            .reshape(&[4, hidden])?;
-                        let out = messages_buf
-                            .view()
-                            .narrow(0, local, 1)?
-                            .reshape(&[4, hidden])?;
-                        depth.mix(
-                            scheme,
-                            msg_keys.view(),
-                            exit.view(),
-                            queries,
-                            out,
-                            n_keys,
-                            DEPTH_RMS_EPS,
-                            scale,
-                        )?;
+                    // Every loop layer's four message queries read the same keys and
+                    // partial, so one mix covers them all.
+                    if n_loop == 0 {
+                        return Ok(());
                     }
-                    Ok(())
+                    depth.mix(
+                        scheme,
+                        msg_keys.view(),
+                        exit.view(),
+                        message_query,
+                        messages_buf.view().reshape(&[n_loop * 4, hidden])?,
+                        n_keys,
+                        DEPTH_RMS_EPS,
+                        scale,
+                    )
                 })?;
                 token.group(format!("restore-{pass}"), |scheme| {
                     ops.recorder(scheme)
