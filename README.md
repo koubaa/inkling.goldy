@@ -26,7 +26,7 @@ Generated weights and activations go to `artifacts/ref/` and are not committed. 
 
 ## Crate
 
-Ammon and Goldy are path dependencies, checked out as siblings of this crate. CI pins `AMMON_REF` and `GOLDY_REF`.
+Ammon and Goldy are path dependencies, checked out as siblings of this crate. CI checks Ammon out from main and pins `GOLDY_REF`.
 
 ```bash
 cargo check
