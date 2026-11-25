@@ -6,7 +6,8 @@
 //! lavapipe that takes hundreds of steps, so earlier tok/s figures are not steady state.
 //! `INKLING_FUSION_REPORT=<visit>` prints that visit's fusion regions, and
 //! `INKLING_HOLD_SECS=<n>` keeps stepping for `n` seconds after warm-up (for `perf -p`),
-//! touching `/tmp/inkling_steady` when it starts.
+//! touching `/tmp/inkling_steady` when it starts. `host_cpu` is the stepping thread's CPU
+//! time per token, so it separates submit cost from waiting on the device.
 
 #![cfg(feature = "vulkan")]
 
@@ -51,6 +52,14 @@ fn micro_spec() -> ForwardSpec {
         },
         logit_cap: 0.05,
     }
+}
+
+/// Nanoseconds this thread has spent on a CPU (Linux schedstat).
+fn thread_cpu_ns() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/schedstat")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0)
 }
 
 fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
@@ -113,7 +122,9 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
         println!("held {n} steps");
     }
     let before = model.replay_totals().unwrap();
+    let cpu_before = thread_cpu_ns();
     let mut times: Vec<f64> = (0..4 * seq).map(|_| step(&mut model)).collect();
+    let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(4 * seq);
     let after = model.replay_totals().unwrap();
     let per = |i: usize| (after[i] - before[i]) as f64 / f64::from(4 * seq);
     println!(
@@ -129,7 +140,7 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
     println!(
         "BENCH {name} lp_threads={} warm_steps={warm_steps} \
          pending={pending} submits/token={schemes} executed_nodes/token={nodes} \
-         mean {:.2} ms ({:.2} tok/s) median {:.2} ms min {:.2} ms",
+         mean {:.2} ms ({:.2} tok/s) median {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
         std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
         mean * 1e3,
         1.0 / mean,
