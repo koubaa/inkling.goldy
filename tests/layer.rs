@@ -254,12 +254,13 @@ fn decoder_layer_matches_pinned_module_on_replay() {
         };
         // docs/RESTRUCTURE.md asks a later sliding visit to execute 26+2K nodes.
         // On this micro visit (top-k 2) that budget is 30. The full visit
-        // promotes to 41 executed nodes. Goldy #342 folds a short GEMV into
-        // the GEMV that consumes it, three dispatches fewer than the 44 this
-        // asserted before that merge. The two gate RMS norms write straight
-        // into the concat rows, so the eight depth_store copies are gone. A
-        // unit softcap is one tanh. Depth mix, the conv rings, split-K, and
-        // the tape store stay one dispatch each.
+        // promotes to 36 executed nodes on goldy main. #342 folds a short GEMV
+        // into the GEMV that consumes it, and #343 gives an in-range indexed
+        // GEMV a semantic site. Together those are eight dispatches fewer than
+        // the 44 this asserted before #342. The two gate RMS norms write
+        // straight into the concat rows, so the eight depth_store copies are
+        // gone. A unit softcap is one tanh. Depth mix, the conv rings, split-K,
+        // and the tape store stay one dispatch each.
         assert!(has("rms_normalize"), "no fused RMS region: {report:?}");
         assert!(has("msg_forget_h"), "no fused message gate: {report:?}");
         assert!(has("swiglu"), "no fused SwiGLU: {report:?}");
@@ -269,7 +270,7 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .iter()
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
-            assert_eq!(recorded.executed_node_count(), 41, "{report:?}");
+            assert_eq!(recorded.executed_node_count(), 36, "{report:?}");
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let started = std::time::Instant::now();
