@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 tools/ref/.venv/
 artifacts/
+assets/tokenizer.json

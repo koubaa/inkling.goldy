@@ -8,8 +8,11 @@
 # The Rust crate path-depends on ammon and goldy as siblings. GPU tests are not
 # optional: the lavapipe job fails if the ICD is missing or is not Vulkan 1.4.
 # Bump AMMON_REF / GOLDY_REF together. Ammon's own GOLDY_REF must be this
-# goldy pin. Ammon is main (3a7c77d, merge of #10). Goldy is main
-# (6aeaa153, merge of #338, matmul_indexed_into).
+# goldy pin. Goldy is main (8a79d75, merge of #341, which includes #340).
+# Ammon main does not build against that goldy, so this PR pins the fusion
+# branch, whose pin matches. Each recorded scheme has automatic fusion on.
+# One scheme for the whole token does not submit on lavapipe: the 48-visit
+# graph is thousands of dispatches and the job does not finish.
 
 name: ci
 
@@ -19,8 +22,8 @@ on:
     branches: [main]
 
 env:
-  AMMON_REF: 3a7c77d353da1478c31a81f8407bb02e75436ddf
-  GOLDY_REF: 6aeaa15355e7265e7f9a486410d7bf16e49a6c97
+  AMMON_REF: 91f61ea703ff52f5ddb0867785d66ff12280b07f
+  GOLDY_REF: 8a79d75d9b8969ce941201284e805e3ca170c4de
 
 jobs:
   rust:
@@ -46,12 +49,15 @@ jobs:
           path: goldy
 
       - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch the pinned Inkling tokenizer
+        working-directory: inkling
+        run: sh tools/fetch_tokenizer.sh
       - name: Check
         working-directory: inkling
         run: cargo check
       - name: Host tests
         working-directory: inkling
-        run: cargo test --lib
+        run: cargo test --lib --test tokenizer
 
   reference-micro:
     runs-on: ubuntu-latest
@@ -117,6 +123,10 @@ jobs:
           DISPLAY= vulkaninfo --summary | tee /tmp/vulkaninfo.txt
           grep -E 'apiVersion[[:space:]]+= 1\.4\.' /tmp/vulkaninfo.txt
           grep -Ei 'deviceName.*(llvmpipe|lavapipe)' /tmp/vulkaninfo.txt
+
+      - name: Fetch the pinned Inkling tokenizer
+        working-directory: inkling
+        run: sh tools/fetch_tokenizer.sh
 
       - name: Vulkan tests
         working-directory: inkling
