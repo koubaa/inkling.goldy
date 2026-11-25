@@ -233,64 +233,37 @@ impl TextModel {
         Ok(())
     }
 
-    /// Schemes one token submits, in step order, repeating ones submitted per pass.
-    fn token_schemes(&self) -> Option<Vec<&Scheme>> {
-        let graph = self.graph.as_ref()?;
-        let schedule = self.spec.schedule;
-        let mut schemes = vec![&graph.upload, &graph.embed];
-        let mut visits = graph.visits.iter();
-        schemes.extend(visits.by_ref().take(schedule.loop_start as usize));
-        schemes.push(&graph.snap);
-        for pass in 0..schedule.passes {
-            if pass > 0 {
-                schemes.extend([&graph.copy_keys, &graph.messages, &graph.restore]);
-            }
-            schemes.extend(visits.by_ref().take(schedule.n_loop() as usize));
-            schemes.push(&graph.copy_exit);
-        }
-        schemes.extend(visits);
-        schemes.push(&graph.finish);
-        Some(schemes)
-    }
-
-    /// Submits per token (including the logits read), executed dispatch nodes per token,
-    /// and whether any background fusion or specialization compile is still outstanding.
+    /// Submits per token, executed dispatch nodes per token, and whether a
+    /// background fusion or specialization compile is still outstanding.
+    ///
+    /// One scheme records the whole token, and the logits read is that submit.
     pub fn replay_census(&self) -> Option<(usize, usize, bool)> {
-        let schemes = self.token_schemes()?;
-        let nodes = schemes.iter().map(|s| s.executed_node_count()).sum();
-        let pending = schemes.iter().any(|s| s.compiles_pending());
-        Some((schemes.len() + 1, nodes, pending))
+        let scheme = &self.graph.as_ref()?.token;
+        Some((1, scheme.executed_node_count(), scheme.compiles_pending()))
     }
 
-    /// Replay counters summed over every recorded scheme: records, topology records,
-    /// clean submits, resubmit hits and retained evictions.
+    /// Replay counters for the token scheme: records, topology records, clean
+    /// submits, resubmit hits and retained evictions.
     pub fn replay_totals(&self) -> Option<[u64; 5]> {
-        let graph = self.graph.as_ref()?;
-        let mut out = [0u64; 5];
-        let singles = [
-            &graph.upload,
-            &graph.embed,
-            &graph.snap,
-            &graph.restore,
-            &graph.copy_keys,
-            &graph.messages,
-            &graph.copy_exit,
-            &graph.finish,
-        ];
-        for scheme in singles.into_iter().chain(graph.visits.iter()) {
-            let stats = scheme.replay_stats();
-            out[0] += stats.records;
-            out[1] += stats.topology_records;
-            out[2] += stats.clean_submits;
-            out[3] += stats.resubmit_hits;
-            out[4] += stats.retained_evictions;
-        }
-        Some(out)
+        let stats = self.graph.as_ref()?.token.replay_stats();
+        Some([
+            stats.records,
+            stats.topology_records,
+            stats.clean_submits,
+            stats.resubmit_hits,
+            stats.retained_evictions,
+        ])
     }
 
-    /// Fusion report and executed node count of visit `index`.
+    /// Fusion report of the token scheme when `index` is a visit in the schedule.
+    ///
+    /// Visits are groups inside that one scheme, so the report is the whole token,
+    /// not a single visit.
     pub fn visit_fusion(&self, index: usize) -> Option<(goldy::FusionReport, usize)> {
-        let scheme = self.graph.as_ref()?.visits.get(index)?;
+        if index >= self.spec.schedule.visits() as usize {
+            return None;
+        }
+        let scheme = &self.graph.as_ref()?.token;
         Some((scheme.fusion_report(), scheme.executed_node_count()))
     }
 

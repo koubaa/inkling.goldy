@@ -4,7 +4,8 @@
 //! Each step cycles positions `0..seq`, so attention length averages over the window.
 //! Timing starts once no scheme has a fusion or specialization compile outstanding; on
 //! lavapipe that takes hundreds of steps, so earlier tok/s figures are not steady state.
-//! `INKLING_FUSION_REPORT=<visit>` prints that visit's fusion regions, and
+//! `INKLING_FUSION_REPORT=<visit>` prints the token scheme's fusion regions
+//! (visits share that scheme) when `visit` is in range, and
 //! `INKLING_HOLD_SECS=<n>` keeps stepping for `n` seconds after warm-up (for `perf -p`),
 //! touching `/tmp/inkling_steady` when it starts. `host_cpu` is the stepping thread's CPU
 //! time per token, so it separates submit cost from waiting on the device.
@@ -90,7 +91,7 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
     if let Ok(which) = std::env::var("INKLING_FUSION_REPORT") {
         let index: usize = which.parse().unwrap();
         if let Some((report, executed)) = model.visit_fusion(index) {
-            println!("visit {index} executes {executed} nodes");
+            println!("token scheme (visit {index}) executes {executed} nodes");
             for region in &report.regions {
                 let labels: Vec<String> = region.labels.iter().map(|l| l.to_string()).collect();
                 println!(
