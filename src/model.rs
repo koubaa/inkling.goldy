@@ -233,6 +233,40 @@ impl TextModel {
         Ok(())
     }
 
+    /// Submits per token, executed dispatch nodes per token, and whether a
+    /// background fusion or specialization compile is still outstanding.
+    ///
+    /// One scheme records the whole token, and the logits read is that submit.
+    pub fn replay_census(&self) -> Option<(usize, usize, bool)> {
+        let scheme = &self.graph.as_ref()?.token;
+        Some((1, scheme.executed_node_count(), scheme.compiles_pending()))
+    }
+
+    /// Replay counters for the token scheme: records, topology records, clean
+    /// submits, resubmit hits and retained evictions.
+    pub fn replay_totals(&self) -> Option<[u64; 5]> {
+        let stats = self.graph.as_ref()?.token.replay_stats();
+        Some([
+            stats.records,
+            stats.topology_records,
+            stats.clean_submits,
+            stats.resubmit_hits,
+            stats.retained_evictions,
+        ])
+    }
+
+    /// Fusion report of the token scheme when `index` is a visit in the schedule.
+    ///
+    /// Visits are groups inside that one scheme, so the report is the whole token,
+    /// not a single visit.
+    pub fn visit_fusion(&self, index: usize) -> Option<(goldy::FusionReport, usize)> {
+        if index >= self.spec.schedule.visits() as usize {
+            return None;
+        }
+        let scheme = &self.graph.as_ref()?.token;
+        Some((scheme.fusion_report(), scheme.executed_node_count()))
+    }
+
     /// Run one token. `position` is the absolute position, also the KV slot.
     pub fn step(&mut self, token: u32, position: u32) -> Result<Vec<f32>> {
         let graph = self
