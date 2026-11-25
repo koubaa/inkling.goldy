@@ -226,8 +226,6 @@ pub struct DecodeLayer {
     mlp_norm: Tensor,
     moe_out: Tensor,
     conv_mlp: Tensor,
-    n1: Tensor,
-    n2: Tensor,
     cat: Tensor,
     rank: Tensor,
     forget_logits: Tensor,
@@ -311,8 +309,6 @@ impl DecodeLayer {
             mlp_norm: h(hidden)?,
             moe_out: h(hidden)?,
             conv_mlp: h(hidden)?,
-            n1: h(hidden)?,
-            n2: h(hidden)?,
             cat: zeros(runtime, &[2, hidden])?,
             rank: h(spec.gate_rank.max(1))?,
             forget_logits: h(hidden)?,
@@ -649,14 +645,10 @@ impl DecodeLayer {
         gate: &GateWeights,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        self.norm
-            .record_unweighted(scheme, hidden, self.n1.view())?;
-        self.norm
-            .record_unweighted(scheme, message, self.n2.view())?;
-        self.depth
-            .store_row(scheme, self.n1.view(), self.cat.view(), 0)?;
-        self.depth
-            .store_row(scheme, self.n2.view(), self.cat.view(), 1)?;
+        let hidden_row = self.cat.view().narrow(0, 0, 1)?.reshape(&[self.spec.hidden])?;
+        let message_row = self.cat.view().narrow(0, 1, 1)?.reshape(&[self.spec.hidden])?;
+        self.norm.record_unweighted(scheme, hidden, hidden_row)?;
+        self.norm.record_unweighted(scheme, message, message_row)?;
         let flat = self.cat.view().reshape(&[self.spec.hidden * 2])?;
         self.linear
             .record(scheme, gate.down.view(), flat, self.rank.view())?;
