@@ -54,15 +54,9 @@ struct Graph {
     ctx: GoldyContext,
     step: Buffer,
     deposit: goldy::DepositTransaction,
-    upload: Scheme,
-    embed: Scheme,
-    visits: Vec<Scheme>,
-    snap: Scheme,
-    restore: Scheme,
-    copy_keys: Scheme,
-    messages: Scheme,
-    copy_exit: Scheme,
-    finish: Scheme,
+    /// Embed, every visit, the loop copies, and the LM head. One submit per token.
+    token: Scheme,
+    logits_sink: goldy::HostSink,
     states: Vec<DecodeLayerState>,
     h: Tensor,
     h2: Tensor,
@@ -241,7 +235,6 @@ impl TextModel {
 
     /// Run one token. `position` is the absolute position, also the KV slot.
     pub fn step(&mut self, token: u32, position: u32) -> Result<Vec<f32>> {
-        let spec = self.spec;
         let graph = self
             .graph
             .as_mut()
@@ -249,40 +242,19 @@ impl TextModel {
         graph.states[0]
             .deposit_position(&graph.deposit, token, position)
             .context("deposit token")?;
-        let _ = graph.upload.submit().context("upload token")?;
-        let _ = graph.embed.submit().context("embed")?;
-        let mut visit = 0usize;
-        for _layer in 0..spec.schedule.loop_start {
-            let _ = graph.visits[visit].submit().context("pre-loop visit")?;
-            visit += 1;
-        }
-        let _ = graph.snap.submit().context("snapshot pre-loop hidden")?;
-        for pass in 0..spec.schedule.passes {
-            if pass > 0 {
-                let _ = graph.copy_keys.submit().context("copy message keys")?;
-                let _ = graph.messages.submit().context("message mix")?;
-                let _ = graph.restore.submit().context("restore pre-loop hidden")?;
-            }
-            for _layer in spec.schedule.loop_start..spec.schedule.loop_end {
-                let _ = graph.visits[visit].submit().context("loop visit")?;
-                visit += 1;
-            }
-            let _ = graph.copy_exit.submit().context("save pass exit")?;
-        }
-        for _layer in spec.schedule.loop_end..spec.schedule.layers {
-            let _ = graph.visits[visit].submit().context("post-loop visit")?;
-            visit += 1;
-        }
-        if visit != graph.visits.len() {
-            bail!("ran {visit} visits, recorded {}", graph.visits.len());
-        }
-        let _ = graph.finish.submit().context("final norm and lm head")?;
-        let mut read = Scheme::new(&graph.ctx);
-        let mut sub = read.submit().context("read logits")?;
-        let bytes = (&mut sub >> graph.logits.buffer())
-            .take::<u8>()
-            .context("logits bytes")?;
-        Ok(bytemuck::cast_slice(&bytes).to_vec())
+        let mut sub = graph.token.submit().context("token")?;
+        let logits = (&mut sub >> &graph.logits_sink)
+            .take::<f32>()
+            .context("logits")?;
+        Ok(logits.to_vec())
+    }
+
+    /// Retention counters for the one recorded token scheme.
+    pub fn replay_stats(&self) -> goldy::ReplayStats {
+        self.graph
+            .as_ref()
+            .map(|graph| graph.token.replay_stats())
+            .unwrap_or_default()
     }
 
     fn record(&self, ctx: &GoldyContext) -> Result<Graph> {
@@ -353,151 +325,169 @@ impl TextModel {
             }],
             BufferKind::Scattered,
         )?;
-        let mut upload = Scheme::new(ctx);
-        upload.set_automatic_fusion(true);
-        let deposit = MemoryExchange::new(ctx).bind_deposit(
-            &mut upload,
+        let exchange = MemoryExchange::new(ctx);
+        let mut token = Scheme::new(ctx);
+        token.set_automatic_fusion(true);
+        let deposit = exchange.bind_deposit(
+            &mut token,
             ammon::kernels::DecodeStep::deposit_target(&step),
         )?;
+        let embedder = &self.embedder;
+        let embed_table = self.embed_table.view();
+        let embed_norm_w = self.embed_norm_w.view();
+        let norm = &self.norm;
+        token.group("embed", |scheme| {
+            embedder.record(scheme, embed_table, &step, embed_raw.view())?;
+            norm.record(scheme, embed_raw.view(), embed_norm_w, h.view())?;
+            Ok(())
+        })?;
 
-        let mut embed = Scheme::new(ctx);
-        embed.set_automatic_fusion(true);
-        self.embedder
-            .record(&mut embed, self.embed_table.view(), &step, embed_raw.view())?;
-        self.norm.record(
-            &mut embed,
-            embed_raw.view(),
-            self.embed_norm_w.view(),
-            h.view(),
-        )?;
-
-        let mut visits = Vec::with_capacity(order.len());
         let mut src_is_h = true;
-        for (index, visit) in order.iter().enumerate() {
-            let n_blocks = blocks_before(schedule, visit.layer, visit.pass);
-            let mut scheme = Scheme::new(ctx);
-            scheme.set_automatic_fusion(true);
-            let (src, dst) = if src_is_h {
-                (h.view(), h2.view())
-            } else {
-                (h2.view(), h.view())
+        let mut visit_at = 0usize;
+        let record_visit =
+            |token: &mut Scheme, index: usize, visit: &Visit, src_is_h: bool| -> Result<bool> {
+                let n_blocks = blocks_before(schedule, visit.layer, visit.pass);
+                let (src, dst) = if src_is_h {
+                    (h.view(), h2.view())
+                } else {
+                    (h2.view(), h.view())
+                };
+                let messages = if visit.pass > 0 {
+                    Some(message_views(
+                        &messages_buf,
+                        visit.layer - schedule.loop_start,
+                        hidden,
+                    )?)
+                } else {
+                    None
+                };
+                let layer = &self.layers[visit.layer as usize];
+                let weights = &self.weights[visit.layer as usize];
+                let state = &states[index];
+                token.group(format!("visit-{index}"), |scheme| {
+                    layer.record(
+                        scheme,
+                        src,
+                        tape.view(),
+                        n_blocks,
+                        messages,
+                        weights,
+                        state,
+                        &step,
+                        dst,
+                    )
+                })?;
+                Ok(!src_is_h)
             };
-            let messages = if visit.pass > 0 {
-                Some(message_views(
-                    &messages_buf,
-                    visit.layer - schedule.loop_start,
-                    hidden,
-                )?)
-            } else {
-                None
-            };
-            self.layers[visit.layer as usize].record(
-                &mut scheme,
-                src,
-                tape.view(),
-                n_blocks,
-                messages,
-                &self.weights[visit.layer as usize],
-                &states[index],
-                &step,
-                dst,
-            )?;
-            visits.push(scheme);
-            src_is_h = !src_is_h;
+        for layer in 0..schedule.loop_start {
+            let visit = &order[visit_at];
+            debug_assert_eq!(visit.layer, layer);
+            src_is_h = record_visit(&mut token, visit_at, visit, src_is_h)?;
+            visit_at += 1;
         }
-
-        let mut snap = Scheme::new(ctx);
-        snap.set_automatic_fusion(true);
-        self.ops
-            .recorder(&mut snap)
-            .copy("snap_hidden", h.view(), h_snap.view())?;
-        let mut restore = Scheme::new(ctx);
-        restore.set_automatic_fusion(true);
-        self.ops
-            .recorder(&mut restore)
-            .copy("restore_hidden", h_snap.view(), h.view())?;
-        let mut copy_exit = Scheme::new(ctx);
-        copy_exit.set_automatic_fusion(true);
-        self.ops
-            .recorder(&mut copy_exit)
-            .copy("pass_exit", h.view(), exit.view())?;
-
-        let mut copy_keys = Scheme::new(ctx);
-        copy_keys.set_automatic_fusion(true);
-        for slot in 0..n_keys {
-            let src = tape
-                .view()
-                .narrow(0, key_start + slot, 1)?
-                .reshape(&[hidden])?;
-            self.depth
-                .store_row(&mut copy_keys, src, msg_keys.view(), slot)?;
-        }
+        let ops = &self.ops;
+        token.group("snap", |scheme| {
+            ops.recorder(scheme)
+                .copy("snap_hidden", h.view(), h_snap.view())
+        })?;
+        let depth = &self.depth;
         let scale = (f64::from(hidden)).powf(-0.5) as f32;
-        let mut messages = Scheme::new(ctx);
-        messages.set_automatic_fusion(true);
-        for local in 0..n_loop {
-            let queries = self
-                .message_query
-                .view()
-                .narrow(0, local * 4, 4)?
-                .reshape(&[4, hidden])?;
-            let out = messages_buf
-                .view()
-                .narrow(0, local, 1)?
-                .reshape(&[4, hidden])?;
-            self.depth.mix(
-                &mut messages,
-                msg_keys.view(),
-                exit.view(),
-                queries,
-                out,
-                n_keys,
+        for pass in 0..schedule.passes {
+            if pass > 0 {
+                token.group(format!("keys-{pass}"), |scheme| {
+                    for slot in 0..n_keys {
+                        let src = tape
+                            .view()
+                            .narrow(0, key_start + slot, 1)?
+                            .reshape(&[hidden])?;
+                        depth.store_row(scheme, src, msg_keys.view(), slot)?;
+                    }
+                    Ok(())
+                })?;
+                let message_query = self.message_query.view();
+                token.group(format!("messages-{pass}"), |scheme| {
+                    for local in 0..n_loop {
+                        let queries = message_query
+                            .narrow(0, local * 4, 4)?
+                            .reshape(&[4, hidden])?;
+                        let out = messages_buf
+                            .view()
+                            .narrow(0, local, 1)?
+                            .reshape(&[4, hidden])?;
+                        depth.mix(
+                            scheme,
+                            msg_keys.view(),
+                            exit.view(),
+                            queries,
+                            out,
+                            n_keys,
+                            DEPTH_RMS_EPS,
+                            scale,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                token.group(format!("restore-{pass}"), |scheme| {
+                    ops.recorder(scheme)
+                        .copy("restore_hidden", h_snap.view(), h.view())
+                })?;
+            }
+            for _layer in schedule.loop_start..schedule.loop_end {
+                let visit = &order[visit_at];
+                src_is_h = record_visit(&mut token, visit_at, visit, src_is_h)?;
+                visit_at += 1;
+            }
+            token.group(format!("exit-{pass}"), |scheme| {
+                ops.recorder(scheme)
+                    .copy("pass_exit", h.view(), exit.view())
+            })?;
+        }
+        for layer in schedule.loop_end..schedule.layers {
+            let visit = &order[visit_at];
+            debug_assert_eq!(visit.layer, layer);
+            src_is_h = record_visit(&mut token, visit_at, visit, src_is_h)?;
+            visit_at += 1;
+        }
+        if visit_at != order.len() {
+            bail!("recorded {visit_at} visits, schedule has {}", order.len());
+        }
+        let n_final = blocks_before(schedule, schedule.layers, 0);
+        let final_query = self.final_query.view();
+        let final_norm_w = self.final_norm_w.view();
+        let lm_head_w = self.lm_head_w.view();
+        let head = &self.head;
+        let softcap = &self.softcap;
+        token.group("finish", |scheme| {
+            depth.mix(
+                scheme,
+                tape.view(),
+                h.view(),
+                final_query,
+                final_mix.view(),
+                n_final,
                 DEPTH_RMS_EPS,
                 scale,
             )?;
-        }
-
-        let n_final = blocks_before(schedule, schedule.layers, 0);
-        let mut finish = Scheme::new(ctx);
-        finish.set_automatic_fusion(true);
-        self.depth.mix(
-            &mut finish,
-            tape.view(),
-            h.view(),
-            self.final_query.view(),
-            final_mix.view(),
-            n_final,
-            DEPTH_RMS_EPS,
-            scale,
-        )?;
-        self.norm.record(
-            &mut finish,
-            final_mix.view().reshape(&[hidden])?,
-            self.final_norm_w.view(),
-            final_hidden.view(),
-        )?;
-        self.head.record(
-            &mut finish,
-            self.lm_head_w.view(),
-            final_hidden.view(),
-            pre_logits.view(),
-        )?;
-        self.softcap
-            .record(&mut finish, pre_logits.view(), logits.view())?;
+            norm.record(
+                scheme,
+                final_mix.view().reshape(&[hidden])?,
+                final_norm_w,
+                final_hidden.view(),
+            )?;
+            head.record(scheme, lm_head_w, final_hidden.view(), pre_logits.view())?;
+            softcap.record(scheme, pre_logits.view(), logits.view())?;
+            Ok(())
+        })?;
+        let logits_sink = exchange
+            .bind_host_sink(&mut token, logits.buffer())
+            .context("logits sink")?;
 
         Ok(Graph {
             ctx: ctx.clone(),
             step,
             deposit,
-            upload,
-            embed,
-            visits,
-            snap,
-            restore,
-            copy_keys,
-            messages,
-            copy_exit,
-            finish,
+            token,
+            logits_sink,
             states,
             h,
             h2,

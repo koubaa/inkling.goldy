@@ -3,7 +3,7 @@
 
 #![cfg(feature = "vulkan")]
 
-use ammon::gpu::create_runtime;
+use ammon::gpu::create_serial_runtime as create_runtime;
 use inkling_goldy::generate::greedy;
 use inkling_goldy::model::{read_golden, TextModel};
 
