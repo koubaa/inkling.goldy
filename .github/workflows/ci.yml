@@ -22,7 +22,7 @@ on:
     branches: [main]
 
 env:
-  AMMON_REF: 91f61ea703ff52f5ddb0867785d66ff12280b07f
+  AMMON_REF: 52ad90d8fce372828465990dbb9559050c1c7b7f
   GOLDY_REF: 8a79d75d9b8969ce941201284e805e3ca170c4de
 
 jobs:
