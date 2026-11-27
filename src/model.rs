@@ -9,7 +9,7 @@
 use crate::layer::{DecodeLayer, DecodeLayerScalars, DecodeLayerWeights};
 use crate::names::{load_decode_layer, DecodeLayerSpec};
 use crate::tape::{blocks_before, message_key_start, LoopSchedule};
-use ammon::{DecodeLayerState, DepthMix, Embedding, Linear, RmsNorm, Softcap};
+use ammon::{configure_inference_scheme, DecodeLayerState, DepthMix, Embedding, Linear, RmsNorm, Softcap};
 use anyhow::{bail, Context, Result};
 use goldy::{
     Buffer, BufferKind, Context as GoldyContext, GoldyError, MemoryExchange, Runtime, Scheme,
@@ -361,6 +361,7 @@ impl TextModel {
         )?;
         let exchange = MemoryExchange::new(ctx);
         let mut token = Scheme::new(ctx);
+        configure_inference_scheme(&mut token);
         token.set_automatic_fusion(true);
         let deposit = exchange.bind_deposit(
             &mut token,
