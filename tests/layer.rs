@@ -254,16 +254,19 @@ fn decoder_layer_matches_pinned_module_on_replay() {
         };
         // docs/RESTRUCTURE.md asks a later sliding visit to execute 26+2K nodes.
         // On this micro visit (top-k 2) that budget is 30. The full visit
-        // promotes to 32 executed nodes on goldy main. #342 folds a short GEMV
+        // promotes to 31 executed nodes on goldy main. #342 folds a short GEMV
         // into the GEMV that consumes it, #343 gives an in-range indexed GEMV
         // a semantic site, and #344 lets the 17-resource message gate fuse.
         // The two gate RMS norms write
         // straight into the concat rows, so the eight depth_store copies are
         // gone. A unit softcap is one tanh. The block ShortConv records its
         // cyclic row-dot form under every policy, so its ring store folds into
-        // the projection and its taps fold into the residual add. Depth mix,
-        // the K/V conv rings, split-K, and the tape store stay one dispatch
-        // each.
+        // the projection and its taps fold into the residual add. The K/V
+        // convolutions are cyclic row dots too, and a ring cache store is
+        // described as cyclic stores, so it folds into the next projection.
+        // Depth mix, split-K, and the tape store stay one dispatch each. The
+        // per-head L2 clips are described up to reassociation, so they fuse
+        // only under relaxed arithmetic.
         assert!(has("rms_normalize"), "no fused RMS region: {report:?}");
         assert!(has("msg_forget_h"), "no fused message gate: {report:?}");
         assert!(has("swiglu"), "no fused SwiGLU: {report:?}");
@@ -273,7 +276,7 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .iter()
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
-            assert_eq!(recorded.executed_node_count(), 32, "{report:?}");
+            assert_eq!(recorded.executed_node_count(), 31, "{report:?}");
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let started = std::time::Instant::now();

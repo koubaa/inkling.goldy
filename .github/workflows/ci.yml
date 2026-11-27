@@ -23,10 +23,11 @@ on:
     types: [goldy_main]
 
 env:
-  # Dependency PRs: https://github.com/koubaa/Ammon/pulls (cursor/single-recording-path-06c6)
-  # and https://github.com/koubaa/goldy/pull/355. Repin both to main after they merge.
-  AMMON_REF: cursor/single-recording-path-06c6
-  GOLDY_REF: cursor/described-dispatches-06c6
+  # Dependency PRs: https://github.com/koubaa/Ammon/pulls (cursor/kv-conv-algebra-06c6,
+  # stacked on cursor/single-recording-path-06c6) and https://github.com/koubaa/goldy/pull/356
+  # (stacked on #355). Repin both to main after they merge.
+  AMMON_REF: cursor/kv-conv-algebra-06c6
+  GOLDY_REF: cursor/cyclic-store-scalar-bounds-06c6
 
 jobs:
   rust:
