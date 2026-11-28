@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 use ammon::{CausalAttentionBlockWeights, SwiGluBlockWeights};
 
 /// Seven-field little-endian header. Negative `vocab_size` means an untied classifier.
@@ -164,7 +164,7 @@ pub struct WeightLayout {
 }
 
 /// Attention and MLP weight views for one layer of the packed blob.
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 #[derive(Clone, Copy)]
 pub struct LayerWeights<'a> {
     pub attention: CausalAttentionBlockWeights<'a>,
@@ -288,7 +288,7 @@ impl WeightLayout {
         Self::packed_view(weights, self.wcls, &[shape.vocab, shape.dim])
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "gpu")]
     pub fn layer<'a>(
         &self,
         weights: &'a goldy::Tensor,

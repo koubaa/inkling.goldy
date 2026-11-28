@@ -1,16 +1,16 @@
 fn main() -> anyhow::Result<()> {
-    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    #[cfg(not(feature = "gpu"))]
     {
-        anyhow::bail!("build with --features cuda and/or --features metal");
+        anyhow::bail!("build with --features vulkan, cuda, or metal");
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "gpu")]
     {
         run()
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 fn run() -> anyhow::Result<()> {
     use anyhow::{bail, Context};
     use llama3_goldy::checkpoint::Checkpoint;

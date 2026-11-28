@@ -1,23 +1,30 @@
 //! Retained Goldy transformer matching llama3.cuda `forward()`.
 //!
 //! Ammon records decoder modules into named groups (`embed`, `layerN/attn`,
-//! `layerN/ffn`, `tail`) on one retained worker. The `DecodeStep` deposit lives on
-//! that submitting root.
+//! `layerN/ffn`, `tail`) on one retained scheme per token. The `DecodeStep`
+//! deposit lives on that submitting root. Every buffer a recorded dispatch binds
+//! is owned by [`ModelTensors`] or [`DecoderModules`], which live as long as the
+//! scheme.
 
 use crate::checkpoint::{Checkpoint, Config, ModelShape};
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::AutoregressiveModel;
-use ammon::{CausalAttentionBlock, Embedding, KvCache, Linear, RmsNorm, SwiGluBlock};
+use ammon::{
+    configure_inference_scheme, CausalAttentionBlock, Embedding, KvCache, Linear, RmsNorm,
+    SwiGluBlock,
+};
 use anyhow::{Context, Result};
 use goldy::{
-    DepositTransaction, FusionReport, HostSink, HostView, MemoryExchange, ReplayStats, Runtime,
+    DepositTransaction, FusionReport, HostSink, MemoryExchange, ReplayStats, Runtime,
     Scheme, Tensor, TensorDType, TensorShape,
 };
 
 struct ModelTensors {
     weights: Tensor,
     x: Tensor,
+    /// Final-norm output, the classifier's input.
+    normed: Tensor,
     step: goldy::Buffer,
     logits: Tensor,
 }
@@ -30,22 +37,28 @@ impl ModelTensors {
             weights: Tensor::from_f32(runtime, TensorShape::vector(n_weights), &checkpoint.weights)
                 .context("upload weights")?,
             x: Tensor::zeros(runtime, TensorShape::vector(shape.dim), TensorDType::F32)?,
+            normed: Tensor::zeros(runtime, TensorShape::vector(shape.dim), TensorDType::F32)?,
             step: DecodeStep::parcel(runtime)?,
             logits: Tensor::zeros(runtime, TensorShape::vector(shape.vocab), TensorDType::F32)?,
         })
     }
 }
 
-/// Scratch the worker retains. Kept alive for the scheme lifetime.
+/// Modules and the scratch they own. The scheme binds that scratch, so these
+/// outlive it.
 struct DecoderModules {
+    embedding: Embedding,
     attention: CausalAttentionBlock,
     mlp: SwiGluBlock,
     cache: KvCache,
+    final_norm: RmsNorm,
+    lm_head: Linear,
 }
 
 impl DecoderModules {
     fn allocate(runtime: &Runtime, shape: &ModelShape) -> Result<Self> {
         Ok(Self {
+            embedding: Embedding::new(runtime)?,
             attention: CausalAttentionBlock::new(runtime, shape.dim, shape.n_heads, shape.seq_len)?,
             mlp: SwiGluBlock::new(runtime, shape.dim, shape.hidden_dim)?,
             cache: KvCache::new(
@@ -55,6 +68,8 @@ impl DecoderModules {
                 shape.n_kv_heads,
                 shape.head_size,
             )?,
+            final_norm: RmsNorm::new(runtime)?,
+            lm_head: Linear::new(runtime)?,
         })
     }
 }
@@ -83,6 +98,7 @@ impl Model {
         let tensors = ModelTensors::allocate(runtime, checkpoint, &shape)?;
 
         let mut worker = Scheme::new(&ctx);
+        configure_inference_scheme(&mut worker);
         // Fused decode is faster once its kernels compile; `GOLDY_FUSION=0` opts out.
         if std::env::var_os("GOLDY_FUSION").is_none() {
             worker.set_automatic_fusion(true);
@@ -91,7 +107,7 @@ impl Model {
         let deposit =
             exchange.bind_deposit(&mut worker, DecodeStep::deposit_target(&tensors.step))?;
 
-        Embedding::new(runtime)?.record_group(
+        modules.embedding.record_group(
             &mut worker,
             "embed",
             layout.embedding(&tensors.weights, &shape)?,
@@ -119,11 +135,16 @@ impl Model {
 
         let rms_final = layout.rms_final(&tensors.weights, &shape)?;
         let classifier = layout.classifier(&tensors.weights, &shape)?;
-        let norm = RmsNorm::new(runtime)?;
-        let lm_head = Linear::new(runtime)?;
         worker.group("tail", |scheme| {
-            norm.record_inplace(scheme, tensors.x.view(), rms_final)?;
-            lm_head.record(scheme, classifier, tensors.x.view(), tensors.logits.view())
+            modules
+                .final_norm
+                .record(scheme, tensors.x.view(), rms_final, tensors.normed.view())?;
+            modules.lm_head.record(
+                scheme,
+                classifier,
+                tensors.normed.view(),
+                tensors.logits.view(),
+            )
         })?;
         let logits_sink = exchange.bind_host_sink(&mut worker, tensors.logits.buffer())?;
 
@@ -137,7 +158,7 @@ impl Model {
         })
     }
 
-    pub fn step(&mut self, token: u32, pos: u32) -> Result<HostView<f32>> {
+    pub fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>> {
         let step = DecodeStep {
             token,
             position: pos,
@@ -146,8 +167,8 @@ impl Model {
         let mut submission = self.worker.submit()?;
         // The sink copy is part of the retained scheme and ledger-ordered after
         // the classifier. Claiming only waits and reads its populated staging.
-        let claim = &mut submission >> &self.logits_sink;
-        Ok(claim.take::<f32>()?)
+        let logits = (&mut submission >> &self.logits_sink).take::<f32>()?;
+        Ok(logits.to_vec())
     }
 
     pub fn replay_stats(&self) -> ReplayStats {
@@ -180,7 +201,7 @@ impl AutoregressiveModel for Model {
         self.config.max_seq_len() as u32
     }
 
-    fn step(&mut self, token: u32, pos: u32) -> Result<HostView<f32>> {
+    fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>> {
         Model::step(self, token, pos)
     }
 }

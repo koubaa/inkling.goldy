@@ -4,12 +4,12 @@ pub mod bench;
 pub mod checkpoint;
 pub mod tokenizer;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 pub mod generate;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 pub mod model;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 pub use checkpoint::LayerWeights;
 pub use checkpoint::{
     checkpoint_file_bytes, Checkpoint, Config, LayerWeightOffsets, ModelShape, WeightLayout,

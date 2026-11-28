@@ -1,5 +1,5 @@
 [workspace]
-members = ["models/inkling"]
+members = ["models/inkling", "models/llama3"]
 resolver = "2"
 
 [workspace.package]

@@ -1,23 +1,14 @@
 [package]
 name = "llama3-goldy"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-description = "llama3.cuda TinyStories generator on Ammon / Goldy (CUDA / Metal)"
-publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "llama2.c-layout Llama decoder (TinyStories) on Ammon and Goldy."
 
-[dependencies]
-ammon = { path = "../ammon", default-features = false }
-anyhow = "1.0"
-bytemuck = { version = "1.25", features = ["derive"] }
-goldy = { path = "../goldy", default-features = false, features = ["tensor"] }
-serde_json = "1.0"
-sha2 = "0.10"
-
-[features]
-default = []
-cuda = ["ammon/cuda", "goldy/cuda"]
-metal = ["ammon/metal", "goldy/metal"]
+[lib]
+name = "llama3_goldy"
+path = "src/lib.rs"
 
 [[bin]]
 name = "llama3-goldy"
@@ -27,10 +18,18 @@ path = "src/main.rs"
 name = "llama3-goldy-bench"
 path = "src/bin/llama3-goldy-bench.rs"
 
-[lib]
-name = "llama3_goldy"
-path = "src/lib.rs"
+[dependencies]
+ammon.workspace = true
+anyhow.workspace = true
+bytemuck.workspace = true
+goldy.workspace = true
+serde_json = "1.0"
+sha2 = "0.10"
 
-[[bin]]
-name = "gemv-probe"
-path = "src/bin/gemv-probe.rs"
+[features]
+default = []
+# Internal: any GPU backend. Enable one of the backend features below.
+gpu = []
+vulkan = ["gpu", "ammon/vulkan", "goldy/vulkan"]
+cuda = ["gpu", "ammon/cuda", "goldy/cuda"]
+metal = ["gpu", "ammon/metal", "goldy/metal"]

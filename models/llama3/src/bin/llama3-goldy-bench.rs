@@ -4,18 +4,18 @@
 //! at position zero so existing KV rows are overwritten; weights stay loaded.
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    #[cfg(not(feature = "gpu"))]
     {
-        anyhow::bail!("build with --features cuda and/or --features metal");
+        anyhow::bail!("build with --features vulkan, cuda, or metal");
     }
 
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "gpu")]
     {
         run()
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 fn run() -> anyhow::Result<()> {
     use anyhow::{bail, Context};
     use llama3_goldy::bench::{
@@ -164,6 +164,9 @@ fn run() -> anyhow::Result<()> {
 
     let features = {
         let mut f = Vec::new();
+        if cfg!(feature = "vulkan") {
+            f.push("vulkan");
+        }
         if cfg!(feature = "cuda") {
             f.push("cuda");
         }
@@ -222,7 +225,7 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 fn emit_result(
     model: &mut llama3_goldy::model::Model,
     tokenizer: &llama3_goldy::tokenizer::Tokenizer,
@@ -331,7 +334,7 @@ fn emit_result(
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 struct LoopOut {
     generated: Vec<i32>,
     pos: u32,
@@ -341,7 +344,7 @@ struct LoopOut {
     compat_elapsed_s: f64,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 fn generate_loop(
     model: &mut llama3_goldy::model::Model,
     prompt_tokens: &[i32],
@@ -406,7 +409,7 @@ fn generate_loop(
     })
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "gpu")]
 fn decode_text(
     tokenizer: &llama3_goldy::tokenizer::Tokenizer,
     prompt_tokens: &[i32],
