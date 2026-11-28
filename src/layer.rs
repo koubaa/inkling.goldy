@@ -231,6 +231,9 @@ pub struct DecodeLayer {
     forget: Tensor,
     gate_logits: Tensor,
     gate: Tensor,
+    forgotten: Tensor,
+    kept: Tensor,
+    gained: Tensor,
 }
 
 impl DecodeLayer {
@@ -313,6 +316,9 @@ impl DecodeLayer {
             forget: h(hidden)?,
             gate_logits: h(hidden)?,
             gate: h(hidden)?,
+            forgotten: h(hidden)?,
+            kept: h(hidden)?,
+            gained: h(hidden)?,
             spec,
         })
     }
@@ -667,14 +673,15 @@ impl DecodeLayer {
         self.tanh
             .record(scheme, self.gate_logits.view(), self.gate.view())?;
         let mut rec = self.ops.recorder(scheme);
-        let forgotten = rec.mul("msg_forget_h", self.forget.view(), hidden)?;
-        let kept = rec.sub("msg_keep", hidden, forgotten.view())?;
-        let gained = rec.mul("msg_gain_m", self.gate.view(), message)?;
-        rec.add_into("msg_mix", kept.view(), gained.view(), out)?;
-        for scratch in [forgotten, kept, gained] {
-            scheme.keep_alive(scratch);
-        }
-        Ok(())
+        rec.mul_into(
+            "msg_forget_h",
+            self.forget.view(),
+            hidden,
+            self.forgotten.view(),
+        )?;
+        rec.sub_into("msg_keep", hidden, self.forgotten.view(), self.kept.view())?;
+        rec.mul_into("msg_gain_m", self.gate.view(), message, self.gained.view())?;
+        rec.add_into("msg_mix", self.kept.view(), self.gained.view(), out)
     }
 
     fn mix(
