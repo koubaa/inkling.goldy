@@ -1,16 +1,23 @@
-# Tiny configs are not run here. inkling2/tiny writes about 440 MiB of weights
-# and 140 MiB of activations; inkling2_loop/tiny writes about 530 MiB and 220 MiB.
-# Both download the tiny-random/inkling-2 tokenizer. The two micro configs are
-# the CI gate: they exercise both architectures, the sliding-window boundary,
-# the loop (including a later pass), clipping, and the 1e-6 cached-decode check.
-# Regenerate tiny locally with `python tools/ref/generate.py`.
+# One workspace, one job set per model. Ammon and Goldy are path dependencies
+# checked out as siblings by .github/actions/checkout-deps at the commits in
+# .github/pins.env. A goldy_main repository dispatch builds against Goldy main
+# instead, and a manual run can override either ref.
 #
-# The Rust crate path-depends on ammon and goldy as siblings. GPU tests are not
-# optional: the lavapipe job fails if the ICD is missing or is not Vulkan 1.4.
-# Goldy and Ammon are checked out from AMMON_REF and GOLDY_REF, which are main
-# except while a dependency pull request is open.
-# Retained command buffers keep their own frame-table rows, and a row holds
-# 32768 indices so one Mini token fits. One scheme per token, fusion on.
+# GPU tests are not optional: .github/actions/lavapipe fails if the lavapipe ICD
+# is missing or is not Vulkan 1.4, and the TinyStories test fails if its assets
+# are missing.
+#
+# Inkling: the two micro configs are the reference gate. They exercise both
+# architectures, the sliding-window boundary, the loop (including a later
+# pass), clipping, and the 1e-6 cached-decode check. The tiny configs are not
+# run here: inkling2/tiny writes about 440 MiB of weights and 140 MiB of
+# activations, inkling2_loop/tiny about 530 MiB and 220 MiB. Regenerate them
+# locally with `python tools/ref/generate.py` in models/inkling. Retained
+# command buffers keep their own frame-table rows, and a row holds 32768
+# indices so one Mini token fits. One scheme per token, fusion on.
+#
+# TinyStories: stories15M must reproduce the llama3.cuda README sample before
+# and after fusion settles. The bench line goes to the job summary.
 
 name: ci
 
@@ -19,117 +26,109 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      ammon_ref:
+        description: Ammon ref (default is the pinned commit)
+        default: ""
+      goldy_ref:
+        description: Goldy ref (default is the pinned commit)
+        default: ""
   repository_dispatch:
     types: [goldy_main]
 
 env:
-  # Dependency PR: https://github.com/koubaa/Ammon/pull/23. Repin to main after it merges.
-  AMMON_REF: cursor/kv-conv-algebra-06c6
-  GOLDY_REF: main
+  CARGO_TERM_COLOR: always
 
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout inkling.goldy
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          path: inkling
-
-      - name: Checkout ammon
-        uses: actions/checkout@v4
+          path: ammon-models
+      - uses: ./ammon-models/.github/actions/checkout-deps
         with:
-          repository: koubaa/ammon
-          ref: ${{ env.AMMON_REF }}
-          path: ammon
-
-      - name: Checkout goldy
-        uses: actions/checkout@v4
-        with:
-          repository: koubaa/goldy
-          ref: ${{ env.GOLDY_REF }}
-          path: goldy
-
+          ammon-ref: ${{ inputs.ammon_ref }}
+          goldy-ref: ${{ github.event_name == 'repository_dispatch' && 'main' || inputs.goldy_ref }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Fetch the pinned Inkling tokenizer
-        working-directory: inkling
-        run: sh tools/fetch_tokenizer.sh
+        working-directory: ammon-models
+        run: sh models/inkling/tools/fetch_tokenizer.sh
       - name: Check
-        working-directory: inkling
-        run: cargo check
+        working-directory: ammon-models
+        run: cargo check --workspace --all-targets
       - name: Host tests
-        working-directory: inkling
-        run: cargo test --lib --test tokenizer
+        working-directory: ammon-models
+        run: |
+          cargo test -p inkling-goldy --lib --test tokenizer
+          cargo test -p llama3-goldy
 
-  reference-micro:
+  inkling-reference-micro:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: models/inkling
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: tools/ref/requirements.lock
+          cache-dependency-path: models/inkling/tools/ref/requirements.lock
       - name: Install the pinned CPU reference environment
         run: python -m pip install -r tools/ref/requirements.lock
       - name: Generate the micro references and check cached decode
         run: python tools/ref/generate.py --only inkling2/micro inkling2_loop/micro
 
-  lavapipe:
+  inkling-lavapipe:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Checkout inkling.goldy
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          path: inkling
-
-      - name: Checkout ammon
-        uses: actions/checkout@v4
+          path: ammon-models
+      - uses: ./ammon-models/.github/actions/checkout-deps
         with:
-          repository: koubaa/ammon
-          ref: ${{ env.AMMON_REF }}
-          path: ammon
-
-      - name: Checkout goldy
-        uses: actions/checkout@v4
-        with:
-          repository: koubaa/goldy
-          ref: ${{ env.GOLDY_REF }}
-          path: goldy
-
+          ammon-ref: ${{ inputs.ammon_ref }}
+          goldy-ref: ${{ github.event_name == 'repository_dispatch' && 'main' || inputs.goldy_ref }}
+      - uses: ./ammon-models/.github/actions/lavapipe
       - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch the pinned Inkling tokenizer
+        working-directory: ammon-models
+        run: sh models/inkling/tools/fetch_tokenizer.sh
+      - name: Vulkan tests
+        working-directory: ammon-models
+        run: cargo test -p inkling-goldy --features vulkan -- --test-threads=1
 
-      - name: Install lavapipe
+  tinystories-lavapipe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ammon-models
+      - uses: ./ammon-models/.github/actions/checkout-deps
+        with:
+          ammon-ref: ${{ inputs.ammon_ref }}
+          goldy-ref: ${{ github.event_name == 'repository_dispatch' && 'main' || inputs.goldy_ref }}
+      - uses: ./ammon-models/.github/actions/lavapipe
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache TinyStories assets
+        uses: actions/cache@v4
+        with:
+          path: ammon-models/models/llama3/models
+          key: tinystories-${{ hashFiles('ammon-models/models/llama3/tools/fetch_assets.py') }}
+      - name: Fetch stories15M and the llama2.c tokenizer
+        working-directory: ammon-models/models/llama3
+        run: python3 tools/fetch_assets.py --only required
+      - name: Vulkan tests
+        working-directory: ammon-models
+        run: cargo test --release -p llama3-goldy --features vulkan -- --test-threads=1 --nocapture
+      - name: Steady-state bench
+        working-directory: ammon-models
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            cmake \
-            pkg-config \
-            unzip \
-            libvulkan1 \
-            libvulkan-dev \
-            mesa-vulkan-drivers \
-            vulkan-tools
-          lvp="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' | head -1)"
-          if [ -z "$lvp" ]; then
-            echo "lavapipe ICD not installed; refusing to skip GPU tests"
-            exit 1
-          fi
-          echo "VK_ICD_FILENAMES=$lvp" >> "$GITHUB_ENV"
-          echo "VK_DRIVER_FILES=$lvp" >> "$GITHUB_ENV"
-          DISPLAY= vulkaninfo --summary | tee /tmp/vulkaninfo.txt
-          grep -E 'apiVersion[[:space:]]+= 1\.4\.' /tmp/vulkaninfo.txt
-          grep -Ei 'deviceName.*(llvmpipe|lavapipe)' /tmp/vulkaninfo.txt
-
-      - name: Fetch the pinned Inkling tokenizer
-        working-directory: inkling
-        run: sh tools/fetch_tokenizer.sh
-
-      - name: Vulkan tests
-        working-directory: inkling
-        run: cargo test --features vulkan -- --test-threads=1
+          cargo test --release -p llama3-goldy --features vulkan --test bench -- --ignored --nocapture \
+            | tee /tmp/bench.txt
+          grep -o 'BENCH.*' /tmp/bench.txt >> "$GITHUB_STEP_SUMMARY"
