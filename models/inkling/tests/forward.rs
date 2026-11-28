@@ -3,7 +3,7 @@
 //! `tests/data/mini_model.safetensors` is the module state dict.
 //! `tests/data/mini_forward.bin` is the compact golden: header, token ids, logits.
 
-#![cfg(feature = "vulkan")]
+#![cfg(feature = "gpu")]
 
 use ammon::gpu::create_serial_runtime as create_runtime;
 use inkling_goldy::layer::DecodeLayerScalars;
@@ -123,11 +123,25 @@ fn mini_forward_matches_the_reference_logits() {
         "mini logits max abs {err}, limit {limit}, rms {rms}"
     );
     let stats = model.replay_stats();
+    #[cfg(not(feature = "metal"))]
     assert!(
         stats.resubmit_hits > 0,
         "token scheme did not replay: {stats:?}"
     );
+    #[cfg(feature = "metal")]
+    assert!(
+        stats.clean_submits > 0,
+        "token scheme was not clean on replay: {stats:?}"
+    );
+    #[cfg(not(feature = "metal"))]
     assert_eq!(stats.retained_evictions, 0, "{stats:?}");
+    #[cfg(feature = "metal")]
+    assert_eq!(
+        stats.retained_evictions,
+        2 * stats.fusion_promotions,
+        "Metal may replace the two retained partitions once when fusion promotes, \
+         but must not churn retained command buffers: {stats:?}"
+    );
 }
 
 fn max_abs(got: &[f32], want: &[f32]) -> f64 {

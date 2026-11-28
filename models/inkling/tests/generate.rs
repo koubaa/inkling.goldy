@@ -1,7 +1,7 @@
 //! Greedy continuation of the committed Mini prompt, token for token with
 //! transformers 5.24.0 `generate(..., do_sample=False)`.
 
-#![cfg(feature = "vulkan")]
+#![cfg(feature = "gpu")]
 
 use ammon::gpu::create_serial_runtime as create_runtime;
 use inkling_goldy::generate::greedy;

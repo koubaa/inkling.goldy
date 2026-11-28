@@ -6,16 +6,18 @@
 //! depth mix, optional MLP message gate, post-attention RMSNorm, routed
 //! experts, post-MLP short conv, and the residual add. KV, the key/value
 //! convolutions, and the post-attention and post-MLP convolutions all live on
-//! the visit's [`DecodeLayerState`]. This module holds no conv ring.
+//! the visit's [`DecodeLayerState`]. Intra-visit activations are scheme-scoped
+//! temporaries on `TransientPool`; this module retains no GPU buffers.
 
 use crate::names::{DecodeLayerSpec, DecodeLayerTensors, MessageGateTensors};
-const DEPTH_RMS_EPS: f32 = 1e-6;
 use ammon::{
     DecodeAttention, DecodeAttentionKind, DecodeAttentionWeights, DecodeLayerState, DecodeMoe,
-    DepthMix, Linear, LogPositionScale, RmsNorm, ShortConv, Softcap,
+    DepthMix, Linear, LogPositionScale, RmsNorm, ShortConv, Softcap, DEPTH_RMS_EPS,
 };
-use anyhow::Context;
+use anyhow::{bail, Context};
 use goldy::{Buffer, GoldyError, Runtime, Scheme, Tensor, TensorDType, TensorShape, TensorView};
+use std::sync::Arc;
+
 /// Scalar hyperparameters that are config fields, not checkpoint tensors.
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeLayerScalars {
@@ -30,176 +32,284 @@ pub struct DecodeLayerScalars {
     pub log_floor: f32,
 }
 
-struct GateWeights {
-    down: Tensor,
-    forget: Tensor,
-    message: Tensor,
+/// Contiguous F32 slab builder so a whole model (or standalone layer) uploads one weight buffer.
+#[derive(Default)]
+pub(crate) struct WeightSlabBuilder {
+    values: Vec<f32>,
 }
 
-/// Device weights for [`DecodeLayer::record`].
+#[derive(Clone)]
+pub(crate) struct WeightSlice {
+    offset: u64,
+    shape: TensorShape,
+}
+
+impl WeightSlice {
+    #[inline]
+    pub(crate) fn view<'a>(&self, slab: &'a Tensor) -> TensorView<'a> {
+        TensorView::packed_at(slab.buffer(), TensorDType::F32, self.offset, self.shape)
+            .expect("WeightSlice validated against slab length at pack time")
+    }
+}
+
+impl WeightSlabBuilder {
+    pub(crate) fn push(&mut self, data: &[f32], dims: &[u32]) -> anyhow::Result<WeightSlice> {
+        let shape = TensorShape::from_dims(dims).context("weight tensor shape")?;
+        let expected = usize::try_from(shape.numel().context("weight tensor numel")?)
+            .context("numel usize")?;
+        if data.len() != expected {
+            bail!(
+                "weight slice has {} f32 elements, shape {:?} expects {}",
+                data.len(),
+                dims,
+                expected
+            );
+        }
+        let offset = u64::try_from(self.values.len()).context("weight offset overflow")?;
+        self.values.extend_from_slice(data);
+        Ok(WeightSlice { offset, shape })
+    }
+
+    pub(crate) fn finish(self, runtime: &Runtime) -> anyhow::Result<Arc<Tensor>> {
+        let len = u32::try_from(self.values.len().max(1)).context("weight slab exceeds u32")?;
+        let values = if self.values.is_empty() {
+            vec![0.0f32; 1]
+        } else {
+            self.values
+        };
+        let slab = Tensor::from_f32(runtime, TensorShape::vector(len), &values)
+            .context("upload packed weight slab")?;
+        Ok(Arc::new(slab))
+    }
+}
+
+#[derive(Clone)]
+struct GateSlices {
+    down: WeightSlice,
+    forget: WeightSlice,
+    message: WeightSlice,
+}
+
+#[derive(Clone)]
+pub(crate) struct PackedLayerSlices {
+    wq: WeightSlice,
+    wk: WeightSlice,
+    wv: WeightSlice,
+    wo: WeightSlice,
+    wgate: WeightSlice,
+    wsink: WeightSlice,
+    wrel: WeightSlice,
+    rel_proj: WeightSlice,
+    q_scale: WeightSlice,
+    rel_scale: WeightSlice,
+    k_conv: WeightSlice,
+    v_conv: WeightSlice,
+    k_conv_proj: Option<WeightSlice>,
+    v_conv_proj: Option<WeightSlice>,
+    input_norm: Option<WeightSlice>,
+    q_norm: Option<WeightSlice>,
+    k_norm: Option<WeightSlice>,
+    v_norm: Option<WeightSlice>,
+    post_norm: WeightSlice,
+    post_attn_conv: WeightSlice,
+    post_mlp_conv: WeightSlice,
+    attn_query: Option<WeightSlice>,
+    mlp_query: WeightSlice,
+    router: WeightSlice,
+    router_bias: WeightSlice,
+    gate_up: WeightSlice,
+    down: WeightSlice,
+    q_gate: Option<GateSlices>,
+    k_gate: Option<GateSlices>,
+    v_gate: Option<GateSlices>,
+    mlp_gate: Option<GateSlices>,
+}
+
+/// Device weights for [`DecodeLayer::record`], sliced from a shared contiguous F32 slab.
 pub struct DecodeLayerWeights {
-    wq: Tensor,
-    wk: Tensor,
-    wv: Tensor,
-    wo: Tensor,
-    wgate: Tensor,
-    wsink: Tensor,
-    wrel: Tensor,
-    rel_proj: Tensor,
-    q_scale: Tensor,
-    rel_scale: Tensor,
-    k_conv: Tensor,
-    v_conv: Tensor,
-    k_conv_proj: Option<Tensor>,
-    v_conv_proj: Option<Tensor>,
-    input_norm: Option<Tensor>,
-    q_norm: Option<Tensor>,
-    k_norm: Option<Tensor>,
-    v_norm: Option<Tensor>,
-    post_norm: Tensor,
-    post_attn_conv: Tensor,
-    post_mlp_conv: Tensor,
-    attn_query: Option<Tensor>,
-    mlp_query: Tensor,
-    router: Tensor,
-    router_bias: Tensor,
-    gate_up: Tensor,
-    down: Tensor,
-    q_gate: Option<GateWeights>,
-    k_gate: Option<GateWeights>,
-    v_gate: Option<GateWeights>,
-    mlp_gate: Option<GateWeights>,
+    slab: Arc<Tensor>,
+    slices: PackedLayerSlices,
 }
 
 impl DecodeLayerWeights {
+    pub(crate) fn pack(
+        builder: &mut WeightSlabBuilder,
+        spec: DecodeLayerSpec,
+        host: &DecodeLayerTensors,
+    ) -> anyhow::Result<PackedLayerSlices> {
+        let hidden = spec.hidden;
+        let q_dim = spec.q_heads * spec.head_dim;
+        let kv_dim = spec.kv_heads * spec.head_dim;
+        let queries = if spec.full { 3 } else { 1 };
+        let conv_dims = if spec.dynamic_conv {
+            [spec.conv_kernel, kv_dim]
+        } else {
+            [kv_dim, spec.conv_kernel]
+        };
+        fn pack_gate(
+            builder: &mut WeightSlabBuilder,
+            g: &MessageGateTensors,
+            gate_rank: u32,
+            hidden: u32,
+        ) -> anyhow::Result<GateSlices> {
+            Ok(GateSlices {
+                down: builder.push(&g.down, &[gate_rank, 2 * hidden])?,
+                forget: builder.push(&g.forget, &[hidden, gate_rank])?,
+                message: builder.push(&g.message, &[hidden, gate_rank])?,
+            })
+        }
+        let wq = builder.push(&host.wq, &[q_dim, hidden])?;
+        let wk = builder.push(&host.wk, &[kv_dim, hidden])?;
+        let wv = builder.push(&host.wv, &[kv_dim, hidden])?;
+        let wo = builder.push(&host.wo, &[hidden, q_dim])?;
+        let wgate = builder.push(&host.wgate, &[q_dim, hidden])?;
+        let wsink = builder.push(&host.wsink, &[spec.q_heads, hidden])?;
+        let wrel = builder.push(&host.wrel, &[spec.q_heads * spec.d_rel, hidden])?;
+        let rel_proj = builder.push(&host.rel_proj, &[spec.d_rel, spec.rel_extent])?;
+        let q_scale = builder.push(&host.q_scale, &[spec.q_heads, spec.head_dim])?;
+        let rel_scale = builder.push(&host.rel_scale, &[spec.q_heads, spec.d_rel])?;
+        let k_conv = builder.push(&host.k_conv, &conv_dims)?;
+        let v_conv = builder.push(&host.v_conv, &conv_dims)?;
+        let k_conv_proj = host
+            .k_conv_proj
+            .as_ref()
+            .map(|d| builder.push(d, &[spec.kv_heads * spec.conv_kernel, hidden]))
+            .transpose()?;
+        let v_conv_proj = host
+            .v_conv_proj
+            .as_ref()
+            .map(|d| builder.push(d, &[spec.kv_heads * spec.conv_kernel, hidden]))
+            .transpose()?;
+        let input_norm = host
+            .input_norm
+            .as_ref()
+            .map(|d| builder.push(d, &[hidden]))
+            .transpose()?;
+        let q_norm = host
+            .q_norm
+            .as_ref()
+            .map(|d| builder.push(d, &[hidden]))
+            .transpose()?;
+        let k_norm = host
+            .k_norm
+            .as_ref()
+            .map(|d| builder.push(d, &[hidden]))
+            .transpose()?;
+        let v_norm = host
+            .v_norm
+            .as_ref()
+            .map(|d| builder.push(d, &[hidden]))
+            .transpose()?;
+        let post_norm = builder.push(&host.post_norm, &[hidden])?;
+        let post_attn_conv = builder.push(&host.post_attn_conv, &[hidden, spec.post_kernel])?;
+        let post_mlp_conv = builder.push(&host.post_mlp_conv, &[hidden, spec.post_kernel])?;
+        let attn_query = host
+            .attn_query
+            .as_ref()
+            .map(|d| builder.push(d, &[queries, hidden]))
+            .transpose()?;
+        let mlp_query = builder.push(&host.mlp_query, &[1, hidden])?;
+        let router = builder.push(&host.router, &[spec.experts, hidden])?;
+        let router_bias = builder.push(&host.router_bias, &[spec.experts])?;
+        let gate_up = builder.push(
+            &host.gate_up,
+            &[spec.experts, 2 * spec.intermediate, hidden],
+        )?;
+        let down = builder.push(&host.down, &[spec.experts, hidden, spec.intermediate])?;
+        let q_gate = host
+            .q_gate
+            .as_ref()
+            .map(|g| pack_gate(builder, g, spec.gate_rank, hidden))
+            .transpose()?;
+        let k_gate = host
+            .k_gate
+            .as_ref()
+            .map(|g| pack_gate(builder, g, spec.gate_rank, hidden))
+            .transpose()?;
+        let v_gate = host
+            .v_gate
+            .as_ref()
+            .map(|g| pack_gate(builder, g, spec.gate_rank, hidden))
+            .transpose()?;
+        let mlp_gate = host
+            .mlp_gate
+            .as_ref()
+            .map(|g| pack_gate(builder, g, spec.gate_rank, hidden))
+            .transpose()?;
+
+        Ok(PackedLayerSlices {
+            wq,
+            wk,
+            wv,
+            wo,
+            wgate,
+            wsink,
+            wrel,
+            rel_proj,
+            q_scale,
+            rel_scale,
+            k_conv,
+            v_conv,
+            k_conv_proj,
+            v_conv_proj,
+            input_norm,
+            q_norm,
+            k_norm,
+            v_norm,
+            post_norm,
+            post_attn_conv,
+            post_mlp_conv,
+            attn_query,
+            mlp_query,
+            router,
+            router_bias,
+            gate_up,
+            down,
+            q_gate,
+            k_gate,
+            v_gate,
+            mlp_gate,
+        })
+    }
+
+    pub(crate) fn from_packed(slab: Arc<Tensor>, slices: PackedLayerSlices) -> Self {
+        Self { slab, slices }
+    }
+
     pub fn from_spec(
         runtime: &Runtime,
         spec: DecodeLayerSpec,
         host: &DecodeLayerTensors,
     ) -> anyhow::Result<Self> {
-        let hidden = spec.hidden;
-        let q_dim = spec.q_heads * spec.head_dim;
-        let kv_dim = spec.kv_heads * spec.head_dim;
-        let queries = if spec.full { 3 } else { 1 };
-        let gate = |g: &MessageGateTensors| -> anyhow::Result<GateWeights> {
-            Ok(GateWeights {
-                down: upload(runtime, &g.down, &[spec.gate_rank, 2 * hidden])?,
-                forget: upload(runtime, &g.forget, &[hidden, spec.gate_rank])?,
-                message: upload(runtime, &g.message, &[hidden, spec.gate_rank])?,
-            })
-        };
-        let conv = |data: &[f32]| -> anyhow::Result<Tensor> {
-            if spec.dynamic_conv {
-                upload(runtime, data, &[spec.conv_kernel, kv_dim])
-            } else {
-                upload(runtime, data, &[kv_dim, spec.conv_kernel])
-            }
-        };
-        Ok(Self {
-            wq: upload(runtime, &host.wq, &[q_dim, hidden])?,
-            wk: upload(runtime, &host.wk, &[kv_dim, hidden])?,
-            wv: upload(runtime, &host.wv, &[kv_dim, hidden])?,
-            wo: upload(runtime, &host.wo, &[hidden, q_dim])?,
-            wgate: upload(runtime, &host.wgate, &[q_dim, hidden])?,
-            wsink: upload(runtime, &host.wsink, &[spec.q_heads, hidden])?,
-            wrel: upload(runtime, &host.wrel, &[spec.q_heads * spec.d_rel, hidden])?,
-            rel_proj: upload(runtime, &host.rel_proj, &[spec.d_rel, spec.rel_extent])?,
-            q_scale: upload(runtime, &host.q_scale, &[spec.q_heads, spec.head_dim])?,
-            rel_scale: upload(runtime, &host.rel_scale, &[spec.q_heads, spec.d_rel])?,
-            k_conv: conv(&host.k_conv)?,
-            v_conv: conv(&host.v_conv)?,
-            k_conv_proj: host
-                .k_conv_proj
-                .as_ref()
-                .map(|d| upload(runtime, d, &[spec.kv_heads * spec.conv_kernel, hidden]))
-                .transpose()?,
-            v_conv_proj: host
-                .v_conv_proj
-                .as_ref()
-                .map(|d| upload(runtime, d, &[spec.kv_heads * spec.conv_kernel, hidden]))
-                .transpose()?,
-            input_norm: host
-                .input_norm
-                .as_ref()
-                .map(|d| upload(runtime, d, &[hidden]))
-                .transpose()?,
-            q_norm: host
-                .q_norm
-                .as_ref()
-                .map(|d| upload(runtime, d, &[hidden]))
-                .transpose()?,
-            k_norm: host
-                .k_norm
-                .as_ref()
-                .map(|d| upload(runtime, d, &[hidden]))
-                .transpose()?,
-            v_norm: host
-                .v_norm
-                .as_ref()
-                .map(|d| upload(runtime, d, &[hidden]))
-                .transpose()?,
-            post_norm: upload(runtime, &host.post_norm, &[hidden])?,
-            post_attn_conv: upload(runtime, &host.post_attn_conv, &[hidden, spec.post_kernel])?,
-            post_mlp_conv: upload(runtime, &host.post_mlp_conv, &[hidden, spec.post_kernel])?,
-            attn_query: host
-                .attn_query
-                .as_ref()
-                .map(|d| upload(runtime, d, &[queries, hidden]))
-                .transpose()?,
-            mlp_query: upload(runtime, &host.mlp_query, &[1, hidden])?,
-            router: upload(runtime, &host.router, &[spec.experts, hidden])?,
-            router_bias: upload(runtime, &host.router_bias, &[spec.experts])?,
-            gate_up: upload(
-                runtime,
-                &host.gate_up,
-                &[spec.experts, 2 * spec.intermediate, hidden],
-            )?,
-            down: upload(
-                runtime,
-                &host.down,
-                &[spec.experts, hidden, spec.intermediate],
-            )?,
-            q_gate: host.q_gate.as_ref().map(gate).transpose()?,
-            k_gate: host.k_gate.as_ref().map(gate).transpose()?,
-            v_gate: host.v_gate.as_ref().map(gate).transpose()?,
-            mlp_gate: host.mlp_gate.as_ref().map(gate).transpose()?,
-        })
+        let mut builder = WeightSlabBuilder::default();
+        let slices = Self::pack(&mut builder, spec, host)?;
+        let slab = builder.finish(runtime)?;
+        Ok(Self::from_packed(slab, slices))
     }
 
     fn views(&self) -> DecodeAttentionWeights<'_> {
+        let slab = self.slab.as_ref();
+        let s = &self.slices;
         DecodeAttentionWeights {
-            wq: self.wq.view(),
-            wk: self.wk.view(),
-            wv: self.wv.view(),
-            wo: self.wo.view(),
-            wgate: self.wgate.view(),
-            wsink: self.wsink.view(),
-            wrel: self.wrel.view(),
-            rel_proj: self.rel_proj.view(),
-            q_scale: self.q_scale.view(),
-            rel_scale: self.rel_scale.view(),
-            k_conv: self.k_conv.view(),
-            v_conv: self.v_conv.view(),
-            k_conv_proj: self.k_conv_proj.as_ref().map(Tensor::view),
-            v_conv_proj: self.v_conv_proj.as_ref().map(Tensor::view),
+            wq: s.wq.view(slab),
+            wk: s.wk.view(slab),
+            wv: s.wv.view(slab),
+            wo: s.wo.view(slab),
+            wgate: s.wgate.view(slab),
+            wsink: s.wsink.view(slab),
+            wrel: s.wrel.view(slab),
+            rel_proj: s.rel_proj.view(slab),
+            q_scale: s.q_scale.view(slab),
+            rel_scale: s.rel_scale.view(slab),
+            k_conv: s.k_conv.view(slab),
+            v_conv: s.v_conv.view(slab),
+            k_conv_proj: s.k_conv_proj.as_ref().map(|w| w.view(slab)),
+            v_conv_proj: s.v_conv_proj.as_ref().map(|w| w.view(slab)),
         }
     }
 }
 
-fn upload(runtime: &Runtime, data: &[f32], dims: &[u32]) -> anyhow::Result<Tensor> {
-    let shape = TensorShape::from_dims(dims).context("decode layer weight shape")?;
-    Tensor::from_f32(runtime, shape, data).context("upload decode layer weight")
-}
-
-fn zeros(runtime: &Runtime, dims: &[u32]) -> anyhow::Result<Tensor> {
-    Ok(Tensor::zeros(
-        runtime,
-        TensorShape::from_dims(dims)?,
-        TensorDType::F32,
-    )?)
-}
-
-/// Scratch and child modules for one decoder layer.
+/// Stateless child modules for one decoder layer configuration.
 pub struct DecodeLayer {
     spec: DecodeLayerSpec,
     depth: DepthMix,
@@ -211,29 +321,6 @@ pub struct DecodeLayer {
     linear: Linear,
     tanh: Softcap,
     scale: f32,
-    depth_out: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    qn: Tensor,
-    kn: Tensor,
-    vn: Tensor,
-    attn_out: Tensor,
-    conv_attn: Tensor,
-    residual: Tensor,
-    mlp: Tensor,
-    mlp_norm: Tensor,
-    moe_out: Tensor,
-    conv_mlp: Tensor,
-    cat: Tensor,
-    rank: Tensor,
-    forget_logits: Tensor,
-    forget: Tensor,
-    gate_logits: Tensor,
-    gate: Tensor,
-    forgotten: Tensor,
-    kept: Tensor,
-    gained: Tensor,
 }
 
 impl DecodeLayer {
@@ -261,7 +348,6 @@ impl DecodeLayer {
             None
         };
         let hidden = spec.hidden;
-        let h = |n| zeros(runtime, &[n]);
         Ok(Self {
             attn: DecodeAttention::new(
                 runtime,
@@ -289,36 +375,13 @@ impl DecodeLayer {
                 scalars.gate_cap,
                 scalars.up_cap,
             )?,
-            norm: RmsNorm::with_eps(runtime, scalars.rms_eps)?,
+            norm: RmsNorm::with_eps(runtime, hidden, scalars.rms_eps)?,
             linear: Linear::new(runtime)?,
-            tanh: Softcap::new(runtime, 1.0)?,
+            tanh: Softcap::new(runtime, hidden, 1.0)?,
             depth: DepthMix::new(runtime)?,
-            post: ShortConv::new(runtime, hidden, spec.post_kernel)?,
+            post: ShortConv::stateless(runtime, hidden, spec.post_kernel)?,
             ops: goldy::TensorKernels::new(runtime)?,
             scale: (f64::from(hidden)).powf(-0.5) as f32,
-            depth_out: zeros(runtime, &[3, hidden])?,
-            q: h(hidden)?,
-            k: h(hidden)?,
-            v: h(hidden)?,
-            qn: h(hidden)?,
-            kn: h(hidden)?,
-            vn: h(hidden)?,
-            attn_out: h(hidden)?,
-            conv_attn: h(hidden)?,
-            residual: h(hidden)?,
-            mlp: h(hidden)?,
-            mlp_norm: h(hidden)?,
-            moe_out: h(hidden)?,
-            conv_mlp: h(hidden)?,
-            cat: zeros(runtime, &[2, hidden])?,
-            rank: h(spec.gate_rank.max(1))?,
-            forget_logits: h(hidden)?,
-            forget: h(hidden)?,
-            gate_logits: h(hidden)?,
-            gate: h(hidden)?,
-            forgotten: h(hidden)?,
-            kept: h(hidden)?,
-            gained: h(hidden)?,
             spec,
         })
     }
@@ -333,6 +396,7 @@ impl DecodeLayer {
     ///
     /// `messages`, when this layer was built with them, is query, key, value,
     /// and MLP, each `[hidden]`. `step.position` is the token position.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         scheme: &mut Scheme,
@@ -368,89 +432,83 @@ impl DecodeLayer {
                 "decoder layer has no message gates for this visit".into(),
             ));
         }
-        self.prepare_attention_streams(scheme, hidden, blocks, n_blocks, messages, weights)?;
-        self.attn.record(
-            scheme,
-            self.qn.view(),
-            self.kn.view(),
-            self.vn.view(),
-            weights.views(),
-            state,
-            step,
-            self.attn_out.view(),
-        )?;
+        let f = TensorDType::F32;
+        let vec_h = || TensorShape::vector(h);
+        let slab = weights.slab.as_ref();
+        let ws = &weights.slices;
+
+        let (qn, kn, vn) =
+            self.prepare_attention_streams(scheme, hidden, blocks, n_blocks, messages, weights)?;
+        let attn_out = scheme.temporary_tensor(vec_h(), f)?;
+        self.attn
+            .record(scheme, qn, kn, vn, weights.views(), state, step, attn_out)?;
         let post_attn = state.post_attn().ok_or_else(|| {
             GoldyError::Validation("visit is missing the post-attention conv ring".into())
         })?;
+        let conv_attn = scheme.temporary_tensor(vec_h(), f)?;
         self.post.record_at_state(
             scheme,
-            self.attn_out.view(),
-            weights.post_attn_conv.view(),
+            attn_out,
+            ws.post_attn_conv.view(slab),
             post_attn,
             step,
-            self.conv_attn.view(),
+            conv_attn,
         )?;
         let mlp_partial = if self.spec.boundary {
             self.depth.store_row(scheme, hidden, blocks, n_blocks)?;
-            self.conv_attn.view()
+            conv_attn
         } else {
-            self.depth
-                .add(scheme, hidden, self.conv_attn.view(), self.residual.view())?;
-            self.residual.view()
+            let residual = scheme.temporary_tensor(vec_h(), f)?;
+            self.depth.add(scheme, hidden, conv_attn, residual)?;
+            residual
         };
+        let mlp_depth = scheme.temporary_tensor(TensorShape::matrix(1, h), f)?;
         self.mix(
             scheme,
             blocks,
             mlp_partial,
-            weights.mlp_query.view(),
-            self.depth_out.view().narrow(0, 0, 1)?,
+            ws.mlp_query.view(slab),
+            mlp_depth,
             mlp_blocks,
         )?;
-        let mixed = self.row(0)?;
-        if let Some(msgs) = messages {
-            let gate = weights.mlp_gate.as_ref().ok_or_else(|| {
+        let mixed = mlp_depth.reshape(&[h])?;
+        // Pass 0 of a loop layer owns the gates and does not run them.
+        let mlp_src = if let Some(msgs) = messages {
+            let gate = ws.mlp_gate.as_ref().ok_or_else(|| {
                 GoldyError::Validation("decoder layer is missing the MLP message gate".into())
             })?;
-            self.record_gate(scheme, mixed, msgs[3], gate, self.mlp.view())?;
-        }
-        // Pass 0 of a loop layer owns the gates and does not run them.
-        let mlp_src = if messages.is_some() {
-            self.mlp.view()
+            let mlp = scheme.temporary_tensor(vec_h(), f)?;
+            self.record_gate(scheme, mixed, msgs[3], gate, slab, mlp)?;
+            mlp
         } else {
             mixed
         };
-        self.norm.record(
-            scheme,
-            mlp_src,
-            weights.post_norm.view(),
-            self.mlp_norm.view(),
-        )?;
+        let mlp_norm = scheme.temporary_tensor(vec_h(), f)?;
+        self.norm
+            .record(scheme, mlp_src, ws.post_norm.view(slab), mlp_norm)?;
+        let moe_out = scheme.temporary_tensor(vec_h(), f)?;
         self.moe.record(
             scheme,
-            self.mlp_norm.view(),
-            weights.router.view(),
-            weights.router_bias.view(),
-            weights.gate_up.view(),
-            weights.down.view(),
-            self.moe_out.view(),
+            mlp_norm,
+            ws.router.view(slab),
+            ws.router_bias.view(slab),
+            ws.gate_up.view(slab),
+            ws.down.view(slab),
+            moe_out,
         )?;
         let post_mlp = state.post_mlp().ok_or_else(|| {
             GoldyError::Validation("visit is missing the post-MLP conv ring".into())
         })?;
+        let conv_mlp = scheme.temporary_tensor(vec_h(), f)?;
         self.post.record_at_state(
             scheme,
-            self.moe_out.view(),
-            weights.post_mlp_conv.view(),
+            moe_out,
+            ws.post_mlp_conv.view(slab),
             post_mlp,
             step,
-            self.conv_mlp.view(),
+            conv_mlp,
         )?;
-        let left = if self.spec.boundary {
-            self.conv_attn.view()
-        } else {
-            self.residual.view()
-        };
-        self.depth.add(scheme, left, self.conv_mlp.view(), out)?;
+        self.depth.add(scheme, mlp_partial, conv_mlp, out)?;
         Ok(())
     }
 
@@ -462,127 +520,117 @@ impl DecodeLayer {
         n_blocks: u32,
         messages: Option<[TensorView<'_>; 4]>,
         weights: &DecodeLayerWeights,
-    ) -> Result<(), GoldyError> {
-        if self.spec.layer_index > 0 {
-            let queries = weights.attn_query.as_ref().ok_or_else(|| {
+    ) -> Result<
+        (
+            TensorView<'static>,
+            TensorView<'static>,
+            TensorView<'static>,
+        ),
+        GoldyError,
+    > {
+        let h = self.spec.hidden;
+        let f = TensorDType::F32;
+        let vec_h = || TensorShape::vector(h);
+        let slab = weights.slab.as_ref();
+        let ws = &weights.slices;
+
+        let depth_out = if self.spec.layer_index > 0 {
+            let queries = ws.attn_query.as_ref().ok_or_else(|| {
                 GoldyError::Validation("decoder layer is missing attention_input.query".into())
             })?;
             let nq = if self.spec.full { 3 } else { 1 };
+            let depth_out = scheme.temporary_tensor(TensorShape::matrix(nq, h), f)?;
             self.mix(
                 scheme,
                 blocks,
                 hidden,
-                queries.view().narrow(0, 0, nq)?,
-                self.depth_out.view().narrow(0, 0, nq)?,
+                queries.view(slab).narrow(0, 0, nq)?,
+                depth_out,
                 n_blocks,
             )?;
-        }
+            Some(depth_out)
+        } else {
+            None
+        };
+        let row = |index: u32| -> Result<TensorView<'static>, GoldyError> {
+            depth_out
+                .expect("checked layer_index > 0")
+                .narrow(0, index, 1)?
+                .reshape(&[h])
+        };
+
+        let qn = scheme.temporary_tensor(vec_h(), f)?;
+        let kn = scheme.temporary_tensor(vec_h(), f)?;
+        let vn = scheme.temporary_tensor(vec_h(), f)?;
+
         if let Some(msgs) = messages {
             let src = |index: u32| -> Result<TensorView<'_>, GoldyError> {
                 if self.spec.layer_index == 0 {
                     Ok(hidden)
                 } else if self.spec.full {
-                    self.row(index)
+                    row(index)
                 } else {
-                    self.row(0)
+                    row(0)
                 }
             };
-            self.gate_into(
-                scheme,
-                src(0)?,
-                msgs[0],
-                weights.q_gate.as_ref(),
-                self.q.view(),
-            )?;
-            self.gate_into(
-                scheme,
-                src(1)?,
-                msgs[1],
-                weights.k_gate.as_ref(),
-                self.k.view(),
-            )?;
-            self.gate_into(
-                scheme,
-                src(2)?,
-                msgs[2],
-                weights.v_gate.as_ref(),
-                self.v.view(),
-            )?;
-            self.norm_stream(
-                scheme,
-                self.q.view(),
-                self.q_weight(weights)?,
-                self.qn.view(),
-            )?;
-            self.norm_stream(
-                scheme,
-                self.k.view(),
-                self.k_weight(weights)?,
-                self.kn.view(),
-            )?;
-            self.norm_stream(
-                scheme,
-                self.v.view(),
-                self.v_weight(weights)?,
-                self.vn.view(),
-            )?;
-            return Ok(());
+            let q = scheme.temporary_tensor(vec_h(), f)?;
+            let k = scheme.temporary_tensor(vec_h(), f)?;
+            let v = scheme.temporary_tensor(vec_h(), f)?;
+            self.gate_into(scheme, src(0)?, msgs[0], ws.q_gate.as_ref(), slab, q)?;
+            self.gate_into(scheme, src(1)?, msgs[1], ws.k_gate.as_ref(), slab, k)?;
+            self.gate_into(scheme, src(2)?, msgs[2], ws.v_gate.as_ref(), slab, v)?;
+            self.norm_stream(scheme, q, self.q_weight(weights)?, qn)?;
+            self.norm_stream(scheme, k, self.k_weight(weights)?, kn)?;
+            self.norm_stream(scheme, v, self.v_weight(weights)?, vn)?;
+            return Ok((qn, kn, vn));
         }
         if self.spec.layer_index == 0 {
             if self.spec.full {
-                self.norm_stream(scheme, hidden, self.q_weight(weights)?, self.qn.view())?;
-                self.norm_stream(scheme, hidden, self.k_weight(weights)?, self.kn.view())?;
-                self.norm_stream(scheme, hidden, self.v_weight(weights)?, self.vn.view())?;
+                self.norm_stream(scheme, hidden, self.q_weight(weights)?, qn)?;
+                self.norm_stream(scheme, hidden, self.k_weight(weights)?, kn)?;
+                self.norm_stream(scheme, hidden, self.v_weight(weights)?, vn)?;
             } else {
                 let w = self.q_weight(weights)?;
-                self.norm_stream(scheme, hidden, w, self.qn.view())?;
-                self.norm_stream(scheme, hidden, w, self.kn.view())?;
-                self.norm_stream(scheme, hidden, w, self.vn.view())?;
+                self.norm_stream(scheme, hidden, w, qn)?;
+                self.norm_stream(scheme, hidden, w, kn)?;
+                self.norm_stream(scheme, hidden, w, vn)?;
             }
-            return Ok(());
+            return Ok((qn, kn, vn));
         }
         if self.spec.full {
-            self.norm_stream(
-                scheme,
-                self.row(0)?,
-                self.q_weight(weights)?,
-                self.qn.view(),
-            )?;
-            self.norm_stream(
-                scheme,
-                self.row(1)?,
-                self.k_weight(weights)?,
-                self.kn.view(),
-            )?;
-            self.norm_stream(
-                scheme,
-                self.row(2)?,
-                self.v_weight(weights)?,
-                self.vn.view(),
-            )?;
+            self.norm_stream(scheme, row(0)?, self.q_weight(weights)?, qn)?;
+            self.norm_stream(scheme, row(1)?, self.k_weight(weights)?, kn)?;
+            self.norm_stream(scheme, row(2)?, self.v_weight(weights)?, vn)?;
         } else {
             let w = self.q_weight(weights)?;
-            let src = self.row(0)?;
-            self.norm_stream(scheme, src, w, self.qn.view())?;
-            self.norm_stream(scheme, src, w, self.kn.view())?;
-            self.norm_stream(scheme, src, w, self.vn.view())?;
+            let src = row(0)?;
+            self.norm_stream(scheme, src, w, qn)?;
+            self.norm_stream(scheme, src, w, kn)?;
+            self.norm_stream(scheme, src, w, vn)?;
         }
-        Ok(())
+        Ok((qn, kn, vn))
     }
 
     fn q_weight<'a>(
         &'a self,
         weights: &'a DecodeLayerWeights,
     ) -> Result<TensorView<'a>, GoldyError> {
+        let slab = weights.slab.as_ref();
         if self.spec.full {
-            weights.q_norm.as_ref().map(Tensor::view).ok_or_else(|| {
-                GoldyError::Validation("full decoder layer is missing q_input_layernorm".into())
-            })
+            weights
+                .slices
+                .q_norm
+                .as_ref()
+                .map(|w| w.view(slab))
+                .ok_or_else(|| {
+                    GoldyError::Validation("full decoder layer is missing q_input_layernorm".into())
+                })
         } else {
             weights
+                .slices
                 .input_norm
                 .as_ref()
-                .map(Tensor::view)
+                .map(|w| w.view(slab))
                 .ok_or_else(|| {
                     GoldyError::Validation(
                         "sliding decoder layer is missing input_layernorm".into(),
@@ -595,10 +643,16 @@ impl DecodeLayer {
         &'a self,
         weights: &'a DecodeLayerWeights,
     ) -> Result<TensorView<'a>, GoldyError> {
+        let slab = weights.slab.as_ref();
         if self.spec.full {
-            weights.k_norm.as_ref().map(Tensor::view).ok_or_else(|| {
-                GoldyError::Validation("full decoder layer is missing k_input_layernorm".into())
-            })
+            weights
+                .slices
+                .k_norm
+                .as_ref()
+                .map(|w| w.view(slab))
+                .ok_or_else(|| {
+                    GoldyError::Validation("full decoder layer is missing k_input_layernorm".into())
+                })
         } else {
             self.q_weight(weights)
         }
@@ -608,10 +662,16 @@ impl DecodeLayer {
         &'a self,
         weights: &'a DecodeLayerWeights,
     ) -> Result<TensorView<'a>, GoldyError> {
+        let slab = weights.slab.as_ref();
         if self.spec.full {
-            weights.v_norm.as_ref().map(Tensor::view).ok_or_else(|| {
-                GoldyError::Validation("full decoder layer is missing v_input_layernorm".into())
-            })
+            weights
+                .slices
+                .v_norm
+                .as_ref()
+                .map(|w| w.view(slab))
+                .ok_or_else(|| {
+                    GoldyError::Validation("full decoder layer is missing v_input_layernorm".into())
+                })
         } else {
             self.q_weight(weights)
         }
@@ -627,18 +687,20 @@ impl DecodeLayer {
         self.norm.record(scheme, x, weight, out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn gate_into(
         &self,
         scheme: &mut Scheme,
         hidden: TensorView<'_>,
         message: TensorView<'_>,
-        gate: Option<&GateWeights>,
+        gate: Option<&GateSlices>,
+        slab: &Tensor,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
         let gate = gate.ok_or_else(|| {
             GoldyError::Validation("decoder layer is missing a message gate".into())
         })?;
-        self.record_gate(scheme, hidden, message, gate, out)
+        self.record_gate(scheme, hidden, message, gate, slab, out)
     }
 
     fn record_gate(
@@ -646,42 +708,41 @@ impl DecodeLayer {
         scheme: &mut Scheme,
         hidden: TensorView<'_>,
         message: TensorView<'_>,
-        gate: &GateWeights,
+        gate: &GateSlices,
+        slab: &Tensor,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        let hidden_row = self.cat.view().narrow(0, 0, 1)?.reshape(&[self.spec.hidden])?;
-        let message_row = self.cat.view().narrow(0, 1, 1)?.reshape(&[self.spec.hidden])?;
+        let h = self.spec.hidden;
+        let f = TensorDType::F32;
+        let vec_h = || TensorShape::vector(h);
+        let cat = scheme.temporary_tensor(TensorShape::matrix(2, h), f)?;
+        let rank = scheme.temporary_tensor(TensorShape::vector(self.spec.gate_rank.max(1)), f)?;
+        let forget_logits = scheme.temporary_tensor(vec_h(), f)?;
+        let forget = scheme.temporary_tensor(vec_h(), f)?;
+        let gate_logits = scheme.temporary_tensor(vec_h(), f)?;
+        let gate_act = scheme.temporary_tensor(vec_h(), f)?;
+        let forgotten = scheme.temporary_tensor(vec_h(), f)?;
+        let kept = scheme.temporary_tensor(vec_h(), f)?;
+        let gained = scheme.temporary_tensor(vec_h(), f)?;
+
+        let hidden_row = cat.narrow(0, 0, 1)?.reshape(&[h])?;
+        let message_row = cat.narrow(0, 1, 1)?.reshape(&[h])?;
         self.norm.record_unweighted(scheme, hidden, hidden_row)?;
         self.norm.record_unweighted(scheme, message, message_row)?;
-        let flat = self.cat.view().reshape(&[self.spec.hidden * 2])?;
+        let flat = cat.reshape(&[h * 2])?;
         self.linear
-            .record(scheme, gate.down.view(), flat, self.rank.view())?;
-        self.linear.record(
-            scheme,
-            gate.forget.view(),
-            self.rank.view(),
-            self.forget_logits.view(),
-        )?;
-        self.tanh
-            .record(scheme, self.forget_logits.view(), self.forget.view())?;
-        self.linear.record(
-            scheme,
-            gate.message.view(),
-            self.rank.view(),
-            self.gate_logits.view(),
-        )?;
-        self.tanh
-            .record(scheme, self.gate_logits.view(), self.gate.view())?;
+            .record(scheme, gate.down.view(slab), flat, rank)?;
+        self.linear
+            .record(scheme, gate.forget.view(slab), rank, forget_logits)?;
+        self.tanh.record(scheme, forget_logits, forget)?;
+        self.linear
+            .record(scheme, gate.message.view(slab), rank, gate_logits)?;
+        self.tanh.record(scheme, gate_logits, gate_act)?;
         let mut rec = self.ops.recorder(scheme);
-        rec.mul_into(
-            "msg_forget_h",
-            self.forget.view(),
-            hidden,
-            self.forgotten.view(),
-        )?;
-        rec.sub_into("msg_keep", hidden, self.forgotten.view(), self.kept.view())?;
-        rec.mul_into("msg_gain_m", self.gate.view(), message, self.gained.view())?;
-        rec.add_into("msg_mix", self.kept.view(), self.gained.view(), out)
+        rec.mul_into("msg_forget_h", forget, hidden, forgotten)?;
+        rec.sub_into("msg_keep", hidden, forgotten, kept)?;
+        rec.mul_into("msg_gain_m", gate_act, message, gained)?;
+        rec.add_into("msg_mix", kept, gained, out)
     }
 
     fn mix(
@@ -703,12 +764,5 @@ impl DecodeLayer {
             DEPTH_RMS_EPS,
             self.scale,
         )
-    }
-
-    fn row(&self, index: u32) -> Result<TensorView<'_>, GoldyError> {
-        self.depth_out
-            .view()
-            .narrow(0, index, 1)?
-            .reshape(&[self.spec.hidden])
     }
 }

@@ -25,4 +25,8 @@ goldy.workspace = true
 
 [features]
 default = []
-vulkan = ["ammon/vulkan", "goldy/vulkan"]
+# Internal: any GPU backend. Enable one backend feature below.
+gpu = []
+vulkan = ["gpu", "ammon/vulkan", "goldy/vulkan"]
+cuda = ["gpu", "ammon/cuda", "goldy/cuda"]
+metal = ["gpu", "ammon/metal", "goldy/metal"]

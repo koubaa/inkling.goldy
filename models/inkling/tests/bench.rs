@@ -1,5 +1,5 @@
 //! Steady-state replay timing. Ignored by default; run with
-//! `cargo test --release --features vulkan --test bench -- --ignored --nocapture --test-threads=1`.
+//! `cargo test --release --features <backend> --test bench -- --ignored --nocapture --test-threads=1`.
 //!
 //! Each step cycles positions `0..seq`, so attention length averages over the window.
 //! Timing starts once no scheme has a fusion or specialization compile outstanding; on
@@ -10,7 +10,7 @@
 //! touching `/tmp/inkling_steady` when it starts. `host_cpu` is the stepping thread's CPU
 //! time per token, so it separates submit cost from waiting on the device.
 
-#![cfg(feature = "vulkan")]
+#![cfg(feature = "gpu")]
 
 use ammon::gpu::create_runtime;
 use inkling_goldy::layer::DecodeLayerScalars;
@@ -72,12 +72,14 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
     let mut pos = 0u32;
     let mut step = |model: &mut TextModel| {
         let t = Instant::now();
-        model.step(1 + pos % 7, pos).unwrap();
+        let logits = model.step_view(1 + pos % 7, pos).unwrap();
+        std::hint::black_box(&*logits);
+        drop(logits);
         pos = (pos + 1) % seq;
         t.elapsed().as_secs_f64()
     };
     let warm = Instant::now();
-    let mut warm_steps = 0;
+    let mut warm_steps = 0u32;
     while warm.elapsed() < Duration::from_secs(240) {
         step(&mut model);
         warm_steps += 1;
@@ -85,9 +87,23 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
         if !pending && warm_steps >= 2 * seq {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+    }
+    let settle_steps = std::env::var("AMMON_BENCH_SETTLE_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(|| (4 * seq).max(32));
+    for _ in 0..settle_steps {
+        step(&mut model);
+    }
+    while warm.elapsed() < Duration::from_secs(240) {
+        let (_, _, pending) = model.replay_census().unwrap();
+        if !pending {
+            break;
+        }
+        step(&mut model);
     }
     let (schemes, nodes, pending) = model.replay_census().unwrap();
+    assert!(!pending, "compiles still pending after warmup and settle");
     if let Ok(which) = std::env::var("INKLING_FUSION_REPORT") {
         let index: usize = which.parse().unwrap();
         if let Some((report, executed)) = model.visit_fusion(index) {
@@ -122,12 +138,26 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
         }
         println!("held {n} steps");
     }
+    let timed_steps = std::env::var("AMMON_BENCH_TIMED_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(if name == "micro" { 128 } else { 64 });
     let before = model.replay_totals().unwrap();
     let cpu_before = thread_cpu_ns();
-    let mut times: Vec<f64> = (0..4 * seq).map(|_| step(&mut model)).collect();
-    let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(4 * seq);
+    let mut times: Vec<f64> = (0..timed_steps).map(|_| step(&mut model)).collect();
+    let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(timed_steps);
     let after = model.replay_totals().unwrap();
-    let per = |i: usize| (after[i] - before[i]) as f64 / f64::from(4 * seq);
+    let records = after[0] - before[0];
+    let topology_records = after[1] - before[1];
+    assert_eq!(
+        records, 0,
+        "steady-state window recorded {records} times (not amortized)"
+    );
+    assert_eq!(
+        topology_records, 0,
+        "steady-state window re-recorded topology {topology_records} times"
+    );
+    let per = |i: usize| (after[i] - before[i]) as f64 / f64::from(timed_steps);
     println!(
         "per token: records {:.1} topology_records {:.1} clean_submits {:.1} resubmit_hits {:.1} evictions {:.1}",
         per(0),
@@ -138,14 +168,20 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
     );
     times.sort_by(f64::total_cmp);
     let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let median = times[times.len() / 2];
+    let p10 = times[times.len() / 10];
+    let p90 = times[(times.len() * 9) / 10];
     println!(
-        "BENCH {name} lp_threads={} warm_steps={warm_steps} \
-         pending={pending} submits/token={schemes} executed_nodes/token={nodes} \
-         mean {:.2} ms ({:.2} tok/s) median {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
+        "BENCH {name} lp_threads={} warm_steps={warm_steps} settle_steps={settle_steps} timed_steps={timed_steps} \
+         submits/token={schemes} executed_nodes/token={nodes} records={records} \
+         median {:.2} ms ({:.2} tok/s) mean {:.2} ms ({:.2} tok/s) p10 {:.2} ms p90 {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
         std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
+        median * 1e3,
+        1.0 / median,
         mean * 1e3,
         1.0 / mean,
-        times[times.len() / 2] * 1e3,
+        p10 * 1e3,
+        p90 * 1e3,
         times[0] * 1e3,
     );
 }

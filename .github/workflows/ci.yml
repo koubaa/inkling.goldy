@@ -84,6 +84,8 @@ jobs:
   inkling-lavapipe:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      AMMON_ARITHMETIC_POLICY: match-recorded
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,3 +134,59 @@ jobs:
           cargo test --release -p llama3-goldy --features vulkan --test bench -- --ignored --nocapture \
             | tee /tmp/bench.txt
           grep -o 'BENCH.*' /tmp/bench.txt >> "$GITHUB_STEP_SUMMARY"
+
+  models-metal:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ammon-models
+      - uses: ./ammon-models/.github/actions/checkout-deps
+        with:
+          ammon-ref: ${{ inputs.ammon_ref }}
+          goldy-ref: ${{ github.event_name == 'repository_dispatch' && 'main' || inputs.goldy_ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache TinyStories assets
+        uses: actions/cache@v4
+        with:
+          path: ammon-models/models/llama3/models
+          key: tinystories-${{ hashFiles('ammon-models/models/llama3/tools/fetch_assets.py') }}
+      - name: Fetch model assets
+        working-directory: ammon-models
+        run: |
+          sh models/inkling/tools/fetch_tokenizer.sh
+          python3 models/llama3/tools/fetch_assets.py --only required
+      - name: MatchRecorded and Relaxed correctness
+        working-directory: ammon-models
+        run: |
+          set -euo pipefail
+          for policy in match-recorded relaxed; do
+            echo "::group::Inkling ($policy)"
+            AMMON_ARITHMETIC_POLICY="$policy" \
+              cargo test --release -p inkling-goldy --features metal -- --test-threads=1
+            echo "::endgroup::"
+            echo "::group::TinyStories ($policy)"
+            AMMON_ARITHMETIC_POLICY="$policy" \
+              cargo test --release -p llama3-goldy --features metal -- --test-threads=1
+            echo "::endgroup::"
+          done
+      - name: Steady-state Metal decode benchmarks (Relaxed)
+        working-directory: ammon-models
+        env:
+          AMMON_ARITHMETIC_POLICY: relaxed
+        run: |
+          set -euo pipefail
+          inkling_log="$(mktemp)"
+          llama_log="$(mktemp)"
+          cargo test --release -p inkling-goldy --features metal --test bench \
+            -- --ignored --nocapture --test-threads=1 \
+            | tee "$inkling_log"
+          cargo test --release -p llama3-goldy --features metal --test bench \
+            -- --ignored --nocapture --test-threads=1 \
+            | tee "$llama_log"
+          {
+            echo "### Steady-state Metal decode (Relaxed)"
+            grep -o 'BENCH.*' "$inkling_log"
+            grep -o 'BENCH.*' "$llama_log"
+          } >> "$GITHUB_STEP_SUMMARY"

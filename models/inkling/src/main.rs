@@ -18,13 +18,13 @@ fn main() {
 }
 
 fn generate(mut args: impl Iterator<Item = String>) {
-    #[cfg(not(feature = "vulkan"))]
+    #[cfg(not(feature = "gpu"))]
     {
         let _ = &mut args;
-        eprintln!("generate needs `cargo run --features vulkan -- generate ...`");
+        eprintln!("generate needs `cargo run --features <backend> -- generate ...`");
         std::process::exit(1);
     }
-    #[cfg(feature = "vulkan")]
+    #[cfg(feature = "gpu")]
     {
         let mut weights = None;
         let mut header = None;

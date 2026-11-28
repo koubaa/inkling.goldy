@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn asset(name: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("models").join(name);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("models")
+        .join(name);
     assert!(
         path.exists(),
         "missing {}; run `python tools/fetch_assets.py --only required` in models/llama3",

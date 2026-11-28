@@ -92,10 +92,7 @@ mod tests {
     #[test]
     fn pad_trims_and_avoids_bos_filler() {
         assert_eq!(pad_or_trim(&[1, 76, 40, 13], 2).unwrap(), vec![1, 76]);
-        assert_eq!(
-            pad_or_trim(&[1, 76], 4).unwrap(),
-            vec![1, 76, 76, 76]
-        );
+        assert_eq!(pad_or_trim(&[1, 76], 4).unwrap(), vec![1, 76, 76, 76]);
         assert_eq!(pad_or_trim(&[1], 3).unwrap(), vec![1, 13, 13]);
     }
 

@@ -6,19 +6,22 @@
 //! rows out of the previous pass, mix them with that pass's exit state, then
 //! restore the pre-loop hidden state.
 
-use crate::layer::{DecodeLayer, DecodeLayerScalars, DecodeLayerWeights};
+use crate::layer::{
+    DecodeLayer, DecodeLayerScalars, DecodeLayerWeights, WeightSlabBuilder, WeightSlice,
+};
 use crate::names::{load_decode_layer, DecodeLayerSpec};
 use crate::tape::{blocks_before, message_key_start, LoopSchedule};
-use ammon::{configure_inference_scheme, DecodeLayerState, DepthMix, Embedding, Linear, RmsNorm, Softcap};
+use ammon::{
+    configure_inference_scheme, DecodeLayerState, DecodeLayerStateSpec, DepthMix, Embedding,
+    Linear, LogitsView, RmsNorm, Softcap, DEPTH_RMS_EPS,
+};
 use anyhow::{bail, Context, Result};
 use goldy::{
     Buffer, BufferKind, Context as GoldyContext, GoldyError, MemoryExchange, Runtime, Scheme,
     Tensor, TensorDType, TensorKernels, TensorShape, TensorView,
 };
-use safetensors::Dtype;
-use safetensors::SafeTensors;
-
-const DEPTH_RMS_EPS: f32 = 1e-6;
+use safetensors::{Dtype, SafeTensors};
+use std::sync::Arc;
 
 /// Widths and loop grid for one random-init Mini forward.
 #[derive(Clone, Copy, Debug)]
@@ -62,13 +65,9 @@ struct Graph {
     h2: Tensor,
     h_snap: Tensor,
     exit: Tensor,
-    embed_raw: Tensor,
     tape: Tensor,
     msg_keys: Tensor,
     messages_buf: Tensor,
-    final_mix: Tensor,
-    final_hidden: Tensor,
-    pre_logits: Tensor,
     logits: Tensor,
 }
 
@@ -79,12 +78,13 @@ pub struct TextModel {
     weights: Vec<DecodeLayerWeights>,
     spec: ForwardSpec,
     runtime: Runtime,
-    embed_table: Tensor,
-    embed_norm_w: Tensor,
-    final_query: Tensor,
-    final_norm_w: Tensor,
-    message_query: Tensor,
-    lm_head_w: Tensor,
+    weight_slab: Arc<Tensor>,
+    embed_table: WeightSlice,
+    embed_norm_w: WeightSlice,
+    final_query: WeightSlice,
+    final_norm_w: WeightSlice,
+    message_query: Option<WeightSlice>,
+    lm_head_w: WeightSlice,
     embedder: Embedding,
     norm: RmsNorm,
     head: Linear,
@@ -105,6 +105,14 @@ impl ammon::AutoregressiveModel for TextModel {
     fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>> {
         TextModel::step(self, token, pos)
     }
+
+    fn step_view(&mut self, token: u32, pos: u32) -> Result<LogitsView> {
+        TextModel::step_view(self, token, pos)
+    }
+
+    fn advance(&mut self, token: u32, pos: u32) -> Result<()> {
+        TextModel::advance(self, token, pos)
+    }
 }
 
 impl TextModel {
@@ -120,6 +128,8 @@ impl TextModel {
         }
         let file = SafeTensors::deserialize(weights).context("model safetensors")?;
         let hidden = spec.hidden;
+        let mut builder = WeightSlabBuilder::default();
+
         let embed_raw = take_f32(&file, "model.embed_tokens.weight")?;
         if embed_raw.0.len() != 2
             || embed_raw.0[1] != hidden as usize
@@ -127,9 +137,8 @@ impl TextModel {
         {
             bail!("embed table {:?} is not [>=vocab, {hidden}]", embed_raw.0);
         }
-        let embed_table = shaped(runtime, &embed_raw.1, &[embed_raw.0[0] as u32, hidden])?;
-        let embed_norm_w = shaped(
-            runtime,
+        let embed_table = builder.push(&embed_raw.1, &[embed_raw.0[0] as u32, hidden])?;
+        let embed_norm_w = builder.push(
             &take(
                 &file,
                 "model.embed_tokens.embed_norm.weight",
@@ -137,13 +146,11 @@ impl TextModel {
             )?,
             &[hidden],
         )?;
-        let final_norm_w = shaped(
-            runtime,
+        let final_norm_w = builder.push(
             &take(&file, "model.norm.weight", &[hidden as usize])?,
             &[hidden],
         )?;
-        let lm_head_w = shaped(
-            runtime,
+        let lm_head_w = builder.push(
             &take(
                 &file,
                 "lm_head.weight",
@@ -151,21 +158,21 @@ impl TextModel {
             )?,
             &[spec.vocab, hidden],
         )?;
-        let final_query = query(runtime, &file, "model.final_input.query", 1, hidden)?;
+        let final_query = pack_query(&mut builder, &file, "model.final_input.query", 1, hidden)?;
         let message_query = if spec.schedule.n_loop() == 0 {
-            zeros(runtime, &[1, hidden])?
+            None
         } else {
-            query(
-                runtime,
+            Some(pack_query(
+                &mut builder,
                 &file,
                 "model.message_input.query",
                 spec.schedule.n_loop() * 4,
                 hidden,
-            )?
+            )?)
         };
 
-        let mut layers = Vec::new();
-        let mut layer_weights = Vec::new();
+        let mut layers = Vec::with_capacity(spec.schedule.layers as usize);
+        let mut packed_layers = Vec::with_capacity(spec.schedule.layers as usize);
         for layer in 0..spec.schedule.layers {
             let full = spec.schedule.is_full(layer);
             let in_loop = layer >= spec.schedule.loop_start && layer < spec.schedule.loop_end;
@@ -195,9 +202,15 @@ impl TextModel {
             }
             let host = load_decode_layer(weights, &format!("model.layers.{layer}."), layer_spec)
                 .with_context(|| format!("layer {layer}"))?;
-            layer_weights.push(DecodeLayerWeights::from_spec(runtime, layer_spec, &host)?);
+            packed_layers.push(DecodeLayerWeights::pack(&mut builder, layer_spec, &host)?);
             layers.push(DecodeLayer::new(runtime, layer_spec, scalars)?);
         }
+
+        let weight_slab = builder.finish(runtime)?;
+        let layer_weights = packed_layers
+            .into_iter()
+            .map(|slices| DecodeLayerWeights::from_packed(Arc::clone(&weight_slab), slices))
+            .collect();
 
         Ok(Self {
             graph: None,
@@ -205,6 +218,7 @@ impl TextModel {
             weights: layer_weights,
             spec,
             runtime: runtime.clone(),
+            weight_slab,
             embed_table,
             embed_norm_w,
             final_query,
@@ -212,9 +226,9 @@ impl TextModel {
             message_query,
             lm_head_w,
             embedder: Embedding::new(runtime)?,
-            norm: RmsNorm::with_eps(runtime, spec.scalars.rms_eps)?,
+            norm: RmsNorm::with_eps(runtime, spec.hidden, spec.scalars.rms_eps)?,
             head: Linear::new(runtime)?,
-            softcap: Softcap::new(runtime, spec.logit_cap)?,
+            softcap: Softcap::new(runtime, spec.vocab, spec.logit_cap)?,
             depth: DepthMix::new(runtime)?,
             ops: TensorKernels::new(runtime)?,
         })
@@ -246,11 +260,15 @@ impl TextModel {
     /// submits, resubmit hits and retained evictions.
     pub fn replay_totals(&self) -> Option<[u64; 5]> {
         let stats = self.graph.as_ref()?.token.replay_stats();
+        #[cfg(not(feature = "metal"))]
+        let resubmit_hits = stats.resubmit_hits;
+        #[cfg(feature = "metal")]
+        let resubmit_hits = 0;
         Some([
             stats.records,
             stats.topology_records,
             stats.clean_submits,
-            stats.resubmit_hits,
+            resubmit_hits,
             stats.retained_evictions,
         ])
     }
@@ -267,8 +285,21 @@ impl TextModel {
         Some((scheme.fusion_report(), scheme.executed_node_count()))
     }
 
-    /// Run one token. `position` is the absolute position, also the KV slot.
-    pub fn step(&mut self, token: u32, position: u32) -> Result<Vec<f32>> {
+    /// Submit one prefill token without waiting on host logits readback.
+    pub fn advance(&mut self, token: u32, position: u32) -> Result<()> {
+        let graph = self
+            .graph
+            .as_mut()
+            .context("bind the forward before stepping")?;
+        graph.states[0]
+            .deposit_position(&graph.deposit, token, position)
+            .context("deposit token")?;
+        let _sub = graph.token.submit().context("token")?;
+        Ok(())
+    }
+
+    /// Run one token and return a zero-copy mapped view over its `[vocab]` logits.
+    pub fn step_view(&mut self, token: u32, position: u32) -> Result<LogitsView> {
         let graph = self
             .graph
             .as_mut()
@@ -280,7 +311,12 @@ impl TextModel {
         let logits = (&mut sub >> &graph.logits_sink)
             .take::<f32>()
             .context("logits")?;
-        Ok(logits.to_vec())
+        Ok(LogitsView::Host(logits))
+    }
+
+    /// Run one token. `position` is the absolute position, also the KV slot.
+    pub fn step(&mut self, token: u32, position: u32) -> Result<Vec<f32>> {
+        Ok(self.step_view(token, position)?.into_vec())
     }
 
     /// Retention counters for the one recorded token scheme.
@@ -314,43 +350,34 @@ impl TextModel {
         let runtime = &self.runtime;
         let h = zeros(runtime, &[hidden])?;
         let h2 = zeros(runtime, &[hidden])?;
-        let embed_raw = zeros(runtime, &[hidden])?;
         let h_snap = zeros(runtime, &[hidden])?;
         let exit = zeros(runtime, &[hidden])?;
         let tape = zeros(runtime, &[tape_rows, hidden])?;
         let msg_keys = zeros(runtime, &[n_keys.max(1), hidden])?;
         let n_loop = schedule.n_loop();
-        let messages_buf = zeros(runtime, &[n_loop, 4, hidden])?;
-        let final_mix = zeros(runtime, &[1, hidden])?;
-        let final_hidden = zeros(runtime, &[hidden])?;
-        let pre_logits = zeros(runtime, &[spec.vocab])?;
+        let messages_buf = zeros(runtime, &[n_loop.max(1), 4, hidden])?;
         let logits = zeros(runtime, &[spec.vocab])?;
 
-        let mut states = Vec::with_capacity(order.len());
-        for visit in &order {
-            let full = schedule.is_full(visit.layer);
-            let state = if full {
-                DecodeLayerState::full(
-                    runtime,
-                    cap,
-                    spec.kv_heads,
-                    spec.head_dim,
-                    spec.q_heads,
-                    spec.conv_kernel,
-                )?
-            } else {
-                DecodeLayerState::sliding(
-                    runtime,
-                    spec.window,
-                    cap,
-                    spec.kv_heads,
-                    spec.head_dim,
-                    spec.q_heads,
-                    spec.conv_kernel,
-                )?
-            };
-            states.push(state.with_post_conv(runtime, hidden)?);
-        }
+        let state_specs: Vec<DecodeLayerStateSpec> = order
+            .iter()
+            .map(|visit| {
+                let window = if schedule.is_full(visit.layer) {
+                    0
+                } else {
+                    spec.window
+                };
+                DecodeLayerStateSpec {
+                    window,
+                    capacity: cap,
+                    kv_heads: spec.kv_heads,
+                    head_dim: spec.head_dim,
+                    q_heads: spec.q_heads,
+                    kernel: spec.conv_kernel,
+                    post_conv_hidden: Some(hidden),
+                }
+            })
+            .collect();
+        let states = DecodeLayerState::allocate_packed(runtime, &state_specs)?;
 
         let step = runtime.acquire_buffer_with_data(
             &[ammon::kernels::DecodeStep {
@@ -367,13 +394,16 @@ impl TextModel {
             &mut token,
             ammon::kernels::DecodeStep::deposit_target(&step),
         )?;
+        let slab = self.weight_slab.as_ref();
         let embedder = &self.embedder;
-        let embed_table = self.embed_table.view();
-        let embed_norm_w = self.embed_norm_w.view();
+        let embed_table = self.embed_table.view(slab);
+        let embed_norm_w = self.embed_norm_w.view(slab);
         let norm = &self.norm;
         token.group("embed", |scheme| {
-            embedder.record(scheme, embed_table, &step, embed_raw.view())?;
-            norm.record(scheme, embed_raw.view(), embed_norm_w, h.view())?;
+            let embed_raw =
+                scheme.temporary_tensor(TensorShape::vector(hidden), TensorDType::F32)?;
+            embedder.record(scheme, embed_table, &step, embed_raw)?;
+            norm.record(scheme, embed_raw, embed_norm_w, h.view())?;
             Ok(())
         })?;
 
@@ -439,24 +469,29 @@ impl TextModel {
                     }
                     Ok(())
                 })?;
-                let message_query = self.message_query.view();
-                token.group(format!("messages-{pass}"), |scheme| {
-                    // Every loop layer's four message queries read the same keys and
-                    // partial, so one mix covers them all.
-                    if n_loop == 0 {
-                        return Ok(());
-                    }
-                    depth.mix(
-                        scheme,
-                        msg_keys.view(),
-                        exit.view(),
-                        message_query,
-                        messages_buf.view().reshape(&[n_loop * 4, hidden])?,
-                        n_keys,
-                        DEPTH_RMS_EPS,
-                        scale,
-                    )
-                })?;
+                if let Some(message_query_slice) = self.message_query.as_ref() {
+                    let message_query = message_query_slice.view(slab);
+                    token.group(format!("messages-{pass}"), |scheme| {
+                        // Every loop layer's four message queries read the same keys and
+                        // partial, so one mix covers them all.
+                        if n_loop == 0 {
+                            return Ok(());
+                        }
+                        depth.mix(
+                            scheme,
+                            msg_keys.view(),
+                            exit.view(),
+                            message_query,
+                            messages_buf
+                                .view()
+                                .narrow(0, 0, n_loop)?
+                                .reshape(&[n_loop * 4, hidden])?,
+                            n_keys,
+                            DEPTH_RMS_EPS,
+                            scale,
+                        )
+                    })?;
+                }
                 token.group(format!("restore-{pass}"), |scheme| {
                     ops.recorder(scheme)
                         .copy("restore_hidden", h_snap.view(), h.view())
@@ -482,30 +517,34 @@ impl TextModel {
             bail!("recorded {visit_at} visits, schedule has {}", order.len());
         }
         let n_final = blocks_before(schedule, schedule.layers, 0);
-        let final_query = self.final_query.view();
-        let final_norm_w = self.final_norm_w.view();
-        let lm_head_w = self.lm_head_w.view();
+        let final_query = self.final_query.view(slab);
+        let final_norm_w = self.final_norm_w.view(slab);
+        let lm_head_w = self.lm_head_w.view(slab);
         let head = &self.head;
         let softcap = &self.softcap;
         token.group("finish", |scheme| {
+            let f = TensorDType::F32;
+            let final_mix = scheme.temporary_tensor(TensorShape::matrix(1, hidden), f)?;
+            let final_hidden = scheme.temporary_tensor(TensorShape::vector(hidden), f)?;
+            let pre_logits = scheme.temporary_tensor(TensorShape::vector(spec.vocab), f)?;
             depth.mix(
                 scheme,
                 tape.view(),
                 h.view(),
                 final_query,
-                final_mix.view(),
+                final_mix,
                 n_final,
                 DEPTH_RMS_EPS,
                 scale,
             )?;
             norm.record(
                 scheme,
-                final_mix.view().reshape(&[hidden])?,
+                final_mix.reshape(&[hidden])?,
                 final_norm_w,
-                final_hidden.view(),
+                final_hidden,
             )?;
-            head.record(scheme, lm_head_w, final_hidden.view(), pre_logits.view())?;
-            softcap.record(scheme, pre_logits.view(), logits.view())?;
+            head.record(scheme, lm_head_w, final_hidden, pre_logits)?;
+            softcap.record(scheme, pre_logits, logits.view())?;
             Ok(())
         })?;
         let logits_sink = exchange
@@ -523,13 +562,9 @@ impl TextModel {
             h2,
             h_snap,
             exit,
-            embed_raw,
             tape,
             msg_keys,
             messages_buf,
-            final_mix,
-            final_hidden,
-            pre_logits,
             logits,
         })
     }
@@ -573,8 +608,11 @@ fn zeros(runtime: &Runtime, dims: &[u32]) -> Result<Tensor> {
     )?)
 }
 
-fn shaped(runtime: &Runtime, data: &[f32], dims: &[u32]) -> Result<Tensor> {
-    Tensor::from_f32(runtime, TensorShape::from_dims(dims)?, data).context("upload weight")
+fn bytes_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
 }
 
 fn take_f32(file: &SafeTensors<'_>, name: &str) -> Result<(Vec<usize>, Vec<f32>)> {
@@ -600,13 +638,13 @@ fn take(file: &SafeTensors<'_>, name: &str, shape: &[usize]) -> Result<Vec<f32>>
     Ok(bytes_f32(view.data()))
 }
 
-fn query(
-    runtime: &Runtime,
+fn pack_query(
+    builder: &mut WeightSlabBuilder,
     file: &SafeTensors<'_>,
     name: &str,
     rows: u32,
     hidden: u32,
-) -> Result<Tensor> {
+) -> Result<WeightSlice> {
     let view = file
         .tensor(name)
         .map_err(|err| anyhow::anyhow!("missing `{name}`: {err}"))?;
@@ -624,7 +662,7 @@ fn query(
     if !ok {
         bail!("`{name}` has shape {shape:?}, expected [{rows}, {hidden}]");
     }
-    shaped(runtime, &data, &[rows, hidden])
+    builder.push(&data, &[rows, hidden])
 }
 
 /// Read a flat or nested config object.
@@ -762,7 +800,7 @@ pub fn read_golden(bytes: &[u8]) -> Result<(ForwardSpec, Vec<u32>, Vec<f32>)> {
         gate_rank: u32_at(&mut at)?,
         vocab: u32_at(&mut at)?,
         seq: u32_at(&mut at)?,
-        scalars: crate::layer::DecodeLayerScalars {
+        scalars: DecodeLayerScalars {
             rms_eps: f32_at(&mut at)?,
             qk_clip: f32_at(&mut at)?,
             rel_clip: f32_at(&mut at)?,
@@ -788,12 +826,6 @@ pub fn read_golden(bytes: &[u8]) -> Result<(ForwardSpec, Vec<u32>, Vec<f32>)> {
         bail!("golden has {} trailing bytes", bytes.len() - at);
     }
     Ok((spec, tokens, logits))
-}
-
-fn bytes_f32(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
 
 #[cfg(test)]
