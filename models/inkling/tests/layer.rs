@@ -8,7 +8,7 @@
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
 use ammon::DecodeLayerState;
-use goldy::{BufferKind, MemoryExchange, Scheme, Tensor, TensorDType, TensorShape};
+use goldy::{BackendType, BufferKind, MemoryExchange, Scheme, Tensor, TensorDType, TensorShape};
 use inkling_goldy::layer::{DecodeLayer, DecodeLayerScalars, DecodeLayerWeights};
 use inkling_goldy::names::{load_decode_layer, DecodeLayerSpec};
 
@@ -277,9 +277,16 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .iter()
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
+            // Metal keeps five native linear dispatches outside generated
+            // algebra regions. The arithmetic-policy delta remains the four
+            // L2 clips above on every backend.
+            let backend_nodes = match device.backend_type() {
+                BackendType::Metal => 36,
+                _ => 31,
+            };
             let expected_nodes = match ammon::inference_arithmetic_policy().unwrap() {
-                goldy::ArithmeticPolicy::MatchRecorded => 35,
-                goldy::ArithmeticPolicy::Relaxed => 31,
+                goldy::ArithmeticPolicy::MatchRecorded => backend_nodes + 4,
+                goldy::ArithmeticPolicy::Relaxed => backend_nodes,
             };
             assert_eq!(recorded.executed_node_count(), expected_nodes, "{report:?}");
             let mut samples = Vec::new();
