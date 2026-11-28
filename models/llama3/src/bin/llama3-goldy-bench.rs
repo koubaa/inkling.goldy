@@ -17,6 +17,7 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(feature = "gpu")]
 fn run() -> anyhow::Result<()> {
+    use ammon::Tokenizer as _;
     use anyhow::{bail, Context};
     use llama3_goldy::bench::{
         expected_checkpoint_sha256, pad_or_trim, sha256_file, COMPAT_TOTAL_POSITIONS, DREAM_PROMPT,
@@ -26,7 +27,6 @@ fn run() -> anyhow::Result<()> {
     use llama3_goldy::model::Model;
     use llama3_goldy::tokenizer::{apply_dream_prompt_patch, Tokenizer};
     use llama3_goldy::{LLAMA3_CUDA_COMMIT, LLAMA_CPP_COMMIT};
-    use ammon::Tokenizer as _;
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -134,7 +134,9 @@ fn run() -> anyhow::Result<()> {
             .min(ckpt.config.max_seq_len() as u32);
         prompt_tokens = pad_or_trim(&prompt_tokens, context_len as usize)?;
         let max_new = (context_len + decode_steps).min(ckpt.config.max_seq_len() as u32 + 1);
-        notes.push("scaling pads/trims prompt tokens to context_len; filler is last non-BOS id".into());
+        notes.push(
+            "scaling pads/trims prompt tokens to context_len; filler is last non-BOS id".into(),
+        );
         (context_len, max_new, decode_steps)
     };
 
@@ -271,7 +273,13 @@ fn emit_result(
         );
         for r in &fusion.regions {
             let labels: Vec<String> = r.labels.iter().map(ToString::to_string).collect();
-            eprintln!("  {:?} {:?} {:?} {}", r.status, r.schedule, r.cost, labels.join(" "));
+            eprintln!(
+                "  {:?} {:?} {:?} {}",
+                r.status,
+                r.schedule,
+                r.cost,
+                labels.join(" ")
+            );
         }
         for r in &fusion.rejected {
             let labels: Vec<String> = r.labels.iter().map(ToString::to_string).collect();
@@ -283,7 +291,10 @@ fn emit_result(
     replay.insert("records".into(), json!(stats.records));
     replay.insert("topology_records".into(), json!(stats.topology_records));
     replay.insert("clean_submits".into(), json!(stats.clean_submits));
-    replay.insert("specialization_warms".into(), json!(stats.specialization_warms));
+    replay.insert(
+        "specialization_warms".into(),
+        json!(stats.specialization_warms),
+    );
     replay.insert(
         "specialization_promotions".into(),
         json!(stats.specialization_promotions),
@@ -355,7 +366,10 @@ fn generate_loop(
     use llama3_goldy::bench::BOS_ID;
     use std::time::Instant;
 
-    anyhow::ensure!(!prompt_tokens.is_empty(), "expected at least one prompt token");
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "expected at least one prompt token"
+    );
     let n_prompt = prompt_tokens.len();
     let mut token = prompt_tokens[0] as u32;
     let mut pos = 0u32;
@@ -369,18 +383,21 @@ fn generate_loop(
 
     while pos < max_new_tokens.saturating_sub(1) {
         let t0 = Instant::now();
-        let logits = model.step(token, pos)?;
-        let t1 = Instant::now();
-        let next = if (pos as usize) < n_prompt.saturating_sub(1) {
+        let (next, t1) = if (pos as usize) < n_prompt.saturating_sub(1) {
+            model.advance(token, pos)?;
+            let t1 = Instant::now();
             prompt_s += t1.duration_since(t0).as_secs_f64();
-            prompt_tokens[pos as usize + 1]
+            (prompt_tokens[pos as usize + 1], t1)
         } else {
+            let logits = model.step_view(token, pos)?;
             let nxt = sample_argmax(&logits);
+            drop(logits);
+            let t1 = Instant::now();
             decode_step_s.push(t1.duration_since(t0).as_secs_f64());
             if decode_step_s.len() == 1 {
                 ttft_s = t1.duration_since(run_start).as_secs_f64();
             }
-            nxt
+            (nxt, t1)
         };
         pos += 1;
         if !first_forward_done {

@@ -16,15 +16,13 @@ use ammon::{
 };
 use anyhow::{Context, Result};
 use goldy::{
-    DepositTransaction, FusionReport, HostSink, MemoryExchange, ReplayStats, Runtime,
-    Scheme, Tensor, TensorDType, TensorShape,
+    DepositTransaction, FusionReport, HostSink, MemoryExchange, ReplayStats, Runtime, Scheme,
+    Tensor, TensorDType, TensorShape,
 };
 
 struct ModelTensors {
     weights: Tensor,
     x: Tensor,
-    /// Final-norm output, the classifier's input.
-    normed: Tensor,
     step: goldy::Buffer,
     logits: Tensor,
 }
@@ -37,7 +35,6 @@ impl ModelTensors {
             weights: Tensor::from_f32(runtime, TensorShape::vector(n_weights), &checkpoint.weights)
                 .context("upload weights")?,
             x: Tensor::zeros(runtime, TensorShape::vector(shape.dim), TensorDType::F32)?,
-            normed: Tensor::zeros(runtime, TensorShape::vector(shape.dim), TensorDType::F32)?,
             step: DecodeStep::parcel(runtime)?,
             logits: Tensor::zeros(runtime, TensorShape::vector(shape.vocab), TensorDType::F32)?,
         })
@@ -136,15 +133,14 @@ impl Model {
         let rms_final = layout.rms_final(&tensors.weights, &shape)?;
         let classifier = layout.classifier(&tensors.weights, &shape)?;
         worker.group("tail", |scheme| {
+            let normed =
+                scheme.temporary_tensor(TensorShape::vector(shape.dim), TensorDType::F32)?;
             modules
                 .final_norm
-                .record(scheme, tensors.x.view(), rms_final, tensors.normed.view())?;
-            modules.lm_head.record(
-                scheme,
-                classifier,
-                tensors.normed.view(),
-                tensors.logits.view(),
-            )
+                .record(scheme, tensors.x.view(), rms_final, normed)?;
+            modules
+                .lm_head
+                .record(scheme, classifier, normed, tensors.logits.view())
         })?;
         let logits_sink = exchange.bind_host_sink(&mut worker, tensors.logits.buffer())?;
 
@@ -158,7 +154,17 @@ impl Model {
         })
     }
 
-    pub fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>> {
+    pub fn advance(&mut self, token: u32, pos: u32) -> Result<()> {
+        let step = DecodeStep {
+            token,
+            position: pos,
+        };
+        (&self.deposit << &step)?;
+        let _submission = self.worker.submit()?;
+        Ok(())
+    }
+
+    pub fn step_view(&mut self, token: u32, pos: u32) -> Result<ammon::LogitsView> {
         let step = DecodeStep {
             token,
             position: pos,
@@ -166,9 +172,13 @@ impl Model {
         (&self.deposit << &step)?;
         let mut submission = self.worker.submit()?;
         // The sink copy is part of the retained scheme and ledger-ordered after
-        // the classifier. Claiming only waits and reads its populated staging.
+        // the classifier. Claiming only waits and borrows its mapped host sink.
         let logits = (&mut submission >> &self.logits_sink).take::<f32>()?;
-        Ok(logits.to_vec())
+        Ok(ammon::LogitsView::Host(logits))
+    }
+
+    pub fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>> {
+        Ok(self.step_view(token, pos)?.into_vec())
     }
 
     pub fn replay_stats(&self) -> ReplayStats {
@@ -203,5 +213,13 @@ impl AutoregressiveModel for Model {
 
     fn step(&mut self, token: u32, pos: u32) -> Result<Vec<f32>> {
         Model::step(self, token, pos)
+    }
+
+    fn step_view(&mut self, token: u32, pos: u32) -> Result<ammon::LogitsView> {
+        Model::step_view(self, token, pos)
+    }
+
+    fn advance(&mut self, token: u32, pos: u32) -> Result<()> {
+        Model::advance(self, token, pos)
     }
 }

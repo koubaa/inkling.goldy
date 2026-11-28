@@ -34,8 +34,9 @@ fn bench_stories15m() {
     let mut pos = 0u32;
     let mut step = |model: &mut Model| {
         let t = Instant::now();
-        let logits = model.step(token, pos).unwrap();
+        let logits = model.step_view(token, pos).unwrap();
         token = sample_argmax(&logits) as u32;
+        drop(logits);
         pos = (pos + 1) % seq;
         if pos == 0 {
             token = 1;
@@ -52,27 +53,57 @@ fn bench_stories15m() {
             break;
         }
     }
-    let pending = model.compiles_pending();
+    let settle_steps = std::env::var("AMMON_BENCH_SETTLE_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(64);
+    for _ in 0..settle_steps {
+        step(&mut model);
+    }
+    while warm.elapsed() < Duration::from_secs(300) {
+        if !model.compiles_pending() {
+            break;
+        }
+        step(&mut model);
+    }
+    assert!(
+        !model.compiles_pending(),
+        "compiles still pending after warmup and settle"
+    );
+    let timed_steps = std::env::var("AMMON_BENCH_SETTLE_TIMED_STEPS")
+        .ok()
+        .or_else(|| std::env::var("AMMON_BENCH_TIMED_STEPS").ok())
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(seq);
     let before = model.replay_stats();
     let cpu_before = thread_cpu_ns();
-    let mut times: Vec<f64> = (0..seq).map(|_| step(&mut model)).collect();
-    let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(seq);
+    let mut times: Vec<f64> = (0..timed_steps).map(|_| step(&mut model)).collect();
+    let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(timed_steps);
     let after = model.replay_stats();
+    let records = after.records - before.records;
+    assert_eq!(
+        records, 0,
+        "steady-state window recorded {records} times (not amortized)"
+    );
     times.sort_by(f64::total_cmp);
     let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let median = times[times.len() / 2];
+    let p10 = times[times.len() / 10];
+    let p90 = times[(times.len() * 9) / 10];
     println!(
-        "BENCH stories15M arithmetic_policy={} lp_threads={} warm_steps={warm_steps} pending={pending} \
-         executed_nodes/token={} fused_regions={} records={} clean_submits/token={:.1} \
-         mean {:.2} ms ({:.1} tok/s) median {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
-        std::env::var("AMMON_ARITHMETIC_POLICY").unwrap_or_else(|_| "default".into()),
+        "BENCH stories15M lp_threads={} warm_steps={warm_steps} settle_steps={settle_steps} timed_steps={timed_steps} \
+         executed_nodes/token={} fused_regions={} records={records} clean_submits/token={:.1} \
+         median {:.2} ms ({:.1} tok/s) mean {:.2} ms ({:.1} tok/s) p10 {:.2} ms p90 {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
         std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
         model.executed_node_count(),
         model.fusion_report().regions.len(),
-        after.records - before.records,
-        (after.clean_submits - before.clean_submits) as f64 / f64::from(seq),
+        (after.clean_submits - before.clean_submits) as f64 / f64::from(timed_steps),
+        median * 1e3,
+        1.0 / median,
         mean * 1e3,
         1.0 / mean,
-        times[times.len() / 2] * 1e3,
+        p10 * 1e3,
+        p90 * 1e3,
         times[0] * 1e3,
     );
 }

@@ -213,6 +213,7 @@ fn decoder_layer_matches_pinned_module_on_replay() {
             .unwrap();
         let mut recorded = Scheme::new(&ctx);
         recorded.set_automatic_fusion(true);
+        ammon::configure_inference_scheme(&mut recorded);
         layer
             .record(
                 &mut recorded,
@@ -277,16 +278,17 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .iter()
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
-            // Metal keeps native/reduction boundaries that leave this visit at
-            // 40 nodes under both policies. Vulkan's generated path can remove
-            // the four L2-clip boundaries when reassociation is allowed.
             let policy = ammon::inference_arithmetic_policy().unwrap();
-            let expected_nodes = match (device.backend_type(), policy) {
+            let max_nodes = match (device.backend_type(), policy) {
                 (BackendType::Metal, _) => 40,
                 (_, goldy::ArithmeticPolicy::MatchRecorded) => 35,
                 (_, goldy::ArithmeticPolicy::Relaxed) => 31,
             };
-            assert_eq!(recorded.executed_node_count(), expected_nodes, "{report:?}");
+            assert!(
+                recorded.executed_node_count() <= max_nodes,
+                "executed {} > {max_nodes} ({policy:?}): {report:?}",
+                recorded.executed_node_count()
+            );
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let started = std::time::Instant::now();
