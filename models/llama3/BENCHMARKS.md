@@ -1,6 +1,6 @@
 # Llama benchmark protocol
 
-Checked-in contract for comparing `llama3.goldy`, a direct PyTorch baseline, pinned
+Checked-in contract for comparing the Goldy `llama3` model, a direct PyTorch baseline, pinned
 `llama3.cuda`, and `llama.cpp` on the Karpathy TinyStories llama2.c checkpoints.
 Performance numbers are informational. CI and local tests enforce parsers, asset
 hashes, JSON schema, checkpoint layout, and generated-token correctness — not
@@ -120,7 +120,7 @@ are not reloaded.
 
 | Engine | How | Notes |
 |--------|-----|--------|
-| Goldy | `src/bin` JSON harness (separate from `llama3-goldy`) | CUDA or Metal; records `ReplayStats`. Automatic kernel fusion is on (`GOLDY_FUSION=0` opts out). Warmup keeps decoding until no specialization or fusion compile is outstanding (`Scheme::compiles_pending`), so `warmup_s` includes that compile time. |
+| Goldy | `src/bin` JSON harness (separate from `llama3-goldy`) | Vulkan, CUDA or Metal; records `ReplayStats`. Automatic kernel fusion is on (`GOLDY_FUSION=0` opts out). Warmup keeps decoding until no specialization or fusion compile is outstanding (`Scheme::compiles_pending`), so `warmup_s` includes that compile time. |
 | PyTorch eager | [`tools/bench/pytorch/`](tools/bench/pytorch/) | Primary baseline. `torch.inference_mode()`, FP32, TF32 off. Runs under the CUDA-torch venv `tools/bench/.cache/torch-venv` (override: `KOBA_BENCH_TORCH_PYTHON`); fails rather than falling back to CPU. |
 | PyTorch compile | same, `--compile` | Secondary label `pytorch-compile`. Inductor + Triton (`triton-windows` on Windows). Compilation is warmup-only. No CUDA Graphs. |
 | llama3.cuda | [`tools/bench/adapters/llama3_cuda/`](tools/bench/adapters/llama3_cuda/) | Copy of commit `424333d1651d2b0fc17d38e9f790e824947e284b`, built in WSL (`KOBA_BENCH_WSL_DISTRO`, default `Ubuntu`) when it has nvcc + g++, otherwise natively with nvcc + MSVC and the Win32 POSIX shim in `win_shim/` (`KOBA_BENCH_LLAMA3_CUDA_EXECUTION=auto\|wsl\|native`). Unpatched binary is verified first; JSON runs use an auditable splice, not edits under `refs/`. |
@@ -135,7 +135,7 @@ Pinned `refs/llama.cpp` commit: `f072b103714dfa1eee531f80b24512faf38e3dd2`.
 python tools/fetch_assets.py
 python -m unittest discover -s tools/bench/tests -v
 
-cargo run --release --features cuda --bin llama3-goldy-bench -- --mode compatibility
+cargo run --release --features vulkan --bin llama3-goldy-bench -- --mode compatibility
 python tools/bench/adapters/goldy/run.py --mode compatibility
 
 tools/bench/.cache/torch-venv/Scripts/python.exe tools/bench/pytorch/bench.py --mode compatibility

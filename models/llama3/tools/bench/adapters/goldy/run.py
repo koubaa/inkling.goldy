@@ -44,7 +44,7 @@ def features() -> list[str]:
         return os.environ["KOBA_BENCH_GOLDY_FEATURES"].split(",")
     if sys.platform == "darwin":
         return ["metal"]
-    return ["cuda"]
+    return ["vulkan"]
 
 
 def build() -> pathlib.Path:

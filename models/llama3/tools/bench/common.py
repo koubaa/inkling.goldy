@@ -13,7 +13,7 @@ from typing import Any, Iterable
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MODELS = ROOT / "models"
 CACHE = pathlib.Path(__file__).resolve().parent / ".cache"
-REFS = ROOT.parent / "refs"
+REFS = ROOT.parents[2] / "refs"
 
 SCHEMA_VERSION = 1
 DREAM_PROMPT = "I have a dream"
