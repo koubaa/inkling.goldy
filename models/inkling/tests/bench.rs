@@ -9,6 +9,8 @@
 //! `INKLING_HOLD_SECS=<n>` keeps stepping for `n` seconds after warm-up (for `perf -p`),
 //! touching `/tmp/inkling_steady` when it starts. `host_cpu` is the stepping thread's CPU
 //! time per token, so it separates submit cost from waiting on the device.
+//! `AMMON_BENCH_SETTLE_STEPS=<n>` steps untimed after promotion before timing, and
+//! `AMMON_BENCH_TIMED_STEPS=<n>` times `n` steps instead of `4 * seq`.
 
 #![cfg(feature = "gpu")]
 
@@ -61,6 +63,13 @@ fn thread_cpu_ns() -> u64 {
         .ok()
         .and_then(|s| s.split_whitespace().next()?.parse().ok())
         .unwrap_or(0)
+}
+
+fn env_steps(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
@@ -122,12 +131,18 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
         }
         println!("held {n} steps");
     }
+    let settle = env_steps("AMMON_BENCH_SETTLE_STEPS", 0);
+    for _ in 0..settle {
+        step(&mut model);
+    }
+    let (_, _, settled_pending) = model.replay_census().unwrap();
+    let timed = env_steps("AMMON_BENCH_TIMED_STEPS", 4 * seq);
     let before = model.replay_totals().unwrap();
     let cpu_before = thread_cpu_ns();
-    let mut times: Vec<f64> = (0..4 * seq).map(|_| step(&mut model)).collect();
-    let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(4 * seq);
+    let mut times: Vec<f64> = (0..timed).map(|_| step(&mut model)).collect();
+    let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(timed);
     let after = model.replay_totals().unwrap();
-    let per = |i: usize| (after[i] - before[i]) as f64 / f64::from(4 * seq);
+    let per = |i: usize| (after[i] - before[i]) as f64 / f64::from(timed);
     println!(
         "per token: records {:.1} topology_records {:.1} clean_submits {:.1} resubmit_hits {:.1} evictions {:.1}",
         per(0),
@@ -140,7 +155,8 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
     let mean = times.iter().sum::<f64>() / times.len() as f64;
     println!(
         "BENCH {name} arithmetic_policy={} lp_threads={} warm_steps={warm_steps} \
-         pending={pending} submits/token={schemes} executed_nodes/token={nodes} \
+         pending={pending} settle={settle} settled_pending={settled_pending} timed={timed} \
+         submits/token={schemes} executed_nodes/token={nodes} \
          mean {:.2} ms ({:.2} tok/s) median {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
         std::env::var("AMMON_ARITHMETIC_POLICY").unwrap_or_else(|_| "default".into()),
         std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
