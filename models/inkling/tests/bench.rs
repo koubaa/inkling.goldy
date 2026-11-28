@@ -55,12 +55,27 @@ fn micro_spec() -> ForwardSpec {
     }
 }
 
-/// Nanoseconds this thread has spent on a CPU (Linux schedstat).
+/// Nanoseconds this thread has spent on a CPU (`CLOCK_THREAD_CPUTIME_ID`).
+#[cfg(unix)]
 fn thread_cpu_ns() -> u64 {
-    std::fs::read_to_string("/proc/thread-self/schedstat")
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse().ok())
-        .unwrap_or(0)
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid writable `timespec` for `clock_gettime`.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if rc == 0 {
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64)
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_ns() -> u64 {
+    0
 }
 
 fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
@@ -201,4 +216,23 @@ fn bench_micro() {
 fn bench_mini() {
     let (spec, _, _) = read_golden(include_bytes!("data/mini_forward.bin")).unwrap();
     run("mini", spec, include_bytes!("data/mini_model.safetensors"));
+}
+
+#[cfg(unix)]
+#[test]
+fn thread_cpu_timer_advances_under_host_work() {
+    let start = thread_cpu_ns();
+    let mut acc = 1u64;
+    let wall = Instant::now();
+    while wall.elapsed() < Duration::from_millis(5) {
+        for i in 1..10_000u64 {
+            acc = std::hint::black_box(acc.wrapping_mul(6364136223846793005).wrapping_add(i));
+        }
+    }
+    std::hint::black_box(acc);
+    let end = thread_cpu_ns();
+    assert!(
+        end > start && start > 0,
+        "CLOCK_THREAD_CPUTIME_ID did not advance: start={start}ns end={end}ns"
+    );
 }

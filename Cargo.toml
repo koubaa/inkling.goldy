@@ -16,5 +16,6 @@ ammon = { path = "../ammon", default-features = false }
 goldy = { path = "../goldy", default-features = false, features = ["tensor"] }
 anyhow = "1.0"
 bytemuck = { version = "1.25", features = ["derive"] }
+libc = "0.2"
 memmap2 = "0.9"
 safetensors = "0.8"

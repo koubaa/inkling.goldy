@@ -23,6 +23,9 @@ memmap2.workspace = true
 ammon = { workspace = true, features = ["hf-tokenizer"] }
 goldy.workspace = true
 
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 [features]
 default = []
 # Internal: any GPU backend. Enable one backend feature below.

@@ -15,12 +15,27 @@ use llama3_goldy::model::Model;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Nanoseconds this thread has spent on a CPU (Linux schedstat).
+/// Nanoseconds this thread has spent on a CPU (`CLOCK_THREAD_CPUTIME_ID`).
+#[cfg(unix)]
 fn thread_cpu_ns() -> u64 {
-    std::fs::read_to_string("/proc/thread-self/schedstat")
-        .ok()
-        .and_then(|s| s.split_whitespace().next()?.parse().ok())
-        .unwrap_or(0)
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid writable `timespec` for `clock_gettime`.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if rc == 0 {
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64)
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_ns() -> u64 {
+    0
 }
 
 #[test]
