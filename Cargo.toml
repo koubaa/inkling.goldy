@@ -1,27 +1,19 @@
-[package]
-name = "inkling-goldy"
+[workspace]
+members = ["models/inkling"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "Inkling 2 text decoder on Ammon and Goldy."
 
-[lib]
-name = "inkling_goldy"
-path = "src/lib.rs"
-
-[[bin]]
-name = "inkling-goldy"
-path = "src/main.rs"
-
-[dependencies]
+# Ammon and Goldy are checked out as siblings of this repository; CI pins both
+# in `.github/pins.env`.
+[workspace.dependencies]
+ammon = { path = "../ammon", default-features = false }
+goldy = { path = "../goldy", default-features = false, features = ["tensor"] }
 anyhow = "1.0"
 bytemuck = { version = "1.25", features = ["derive"] }
-safetensors = "0.8"
 memmap2 = "0.9"
-ammon = { path = "../ammon", default-features = false, features = ["hf-tokenizer"] }
-goldy = { path = "../goldy", default-features = false, features = ["tensor"] }
-
-[features]
-default = []
-vulkan = ["ammon/vulkan", "goldy/vulkan"]
+safetensors = "0.8"
