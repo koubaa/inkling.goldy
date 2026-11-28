@@ -1,0 +1,28 @@
+[package]
+name = "inkling-goldy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Inkling 2 text decoder on Ammon and Goldy."
+
+[lib]
+name = "inkling_goldy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inkling-goldy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+safetensors.workspace = true
+memmap2.workspace = true
+ammon = { workspace = true, features = ["hf-tokenizer"] }
+goldy.workspace = true
+
+[features]
+default = []
+vulkan = ["ammon/vulkan", "goldy/vulkan"]

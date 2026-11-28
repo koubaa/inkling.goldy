@@ -9,7 +9,7 @@ fn main() {
         None => {
             let mini = inkling_goldy::tape::LoopSchedule::mini();
             println!(
-                "inkling.goldy: Inkling 2 on Ammon. Mini schedule is {} visits. \
+                "inkling-goldy: Inkling 2 on Ammon. Mini schedule is {} visits. \
                  `inkling-goldy generate --weights <safetensors> --header <mini_forward.bin> --prompt 30,13 --max-new 2`",
                 mini.visits()
             );

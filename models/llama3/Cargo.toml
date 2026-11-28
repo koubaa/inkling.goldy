@@ -1,0 +1,36 @@
+[package]
+name = "llama3-goldy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "llama2.c-layout Llama decoder (TinyStories) on Ammon and Goldy."
+
+[lib]
+name = "llama3_goldy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llama3-goldy"
+path = "src/main.rs"
+
+[[bin]]
+name = "llama3-goldy-bench"
+path = "src/bin/llama3-goldy-bench.rs"
+
+[dependencies]
+ammon.workspace = true
+anyhow.workspace = true
+bytemuck.workspace = true
+goldy.workspace = true
+serde_json = "1.0"
+sha2 = "0.10"
+
+[features]
+default = []
+# Internal: any GPU backend. Enable one of the backend features below.
+gpu = []
+vulkan = ["gpu", "ammon/vulkan", "goldy/vulkan"]
+cuda = ["gpu", "ammon/cuda", "goldy/cuda"]
+metal = ["gpu", "ammon/metal", "goldy/metal"]

@@ -1,0 +1,49 @@
+name: Check out Ammon and Goldy
+description: >
+  Check koubaa/ammon and koubaa/goldy out as siblings of this repository at the
+  commits in .github/pins.env, unless a ref overrides one. The workspace
+  path-depends on ../ammon and ../goldy.
+
+inputs:
+  repo-path:
+    description: Path this repository was checked out to.
+    default: ammon-models
+  ammon-ref:
+    description: Ammon ref to use instead of the pinned commit.
+    default: ""
+  goldy-ref:
+    description: Goldy ref to use instead of the pinned commit.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Read pins
+      id: pins
+      shell: bash
+      env:
+        REPO_PATH: ${{ inputs.repo-path }}
+        AMMON_REF: ${{ inputs.ammon-ref }}
+        GOLDY_REF: ${{ inputs.goldy-ref }}
+      run: |
+        set -euo pipefail
+        . "$REPO_PATH/.github/pins.env"
+        ammon="$AMMON_REF"
+        goldy="$GOLDY_REF"
+        echo "ammon=${ammon:-$AMMON_SHA}" >> "$GITHUB_OUTPUT"
+        echo "goldy=${goldy:-$GOLDY_SHA}" >> "$GITHUB_OUTPUT"
+        echo "Ammon ${ammon:-$AMMON_SHA}, Goldy ${goldy:-$GOLDY_SHA}" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Checkout ammon
+      uses: actions/checkout@v4
+      with:
+        repository: koubaa/ammon
+        ref: ${{ steps.pins.outputs.ammon }}
+        path: ammon
+
+    - name: Checkout goldy
+      uses: actions/checkout@v4
+      with:
+        repository: koubaa/goldy
+        ref: ${{ steps.pins.outputs.goldy }}
+        path: goldy
