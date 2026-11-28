@@ -616,6 +616,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "goldy",
+ "libc",
  "memmap2",
  "safetensors",
 ]
@@ -694,6 +695,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "goldy",
+ "libc",
  "serde_json",
  "sha2",
 ]
