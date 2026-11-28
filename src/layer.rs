@@ -205,7 +205,6 @@ pub struct DecodeLayer {
     depth: DepthMix,
     post: ShortConv,
     ops: goldy::TensorKernels,
-    held: std::sync::Mutex<Vec<Tensor>>,
     attn: DecodeAttention,
     moe: DecodeMoe,
     norm: RmsNorm,
@@ -293,7 +292,6 @@ impl DecodeLayer {
             depth: DepthMix::new(runtime)?,
             post: ShortConv::new(runtime, hidden, spec.post_kernel)?,
             ops: goldy::TensorKernels::new(runtime)?,
-            held: std::sync::Mutex::new(Vec::new()),
             scale: (f64::from(hidden)).powf(-0.5) as f32,
             depth_out: zeros(runtime, &[3, hidden])?,
             q: h(hidden)?,
@@ -673,9 +671,9 @@ impl DecodeLayer {
         let kept = rec.sub("msg_keep", hidden, forgotten.view())?;
         let gained = rec.mul("msg_gain_m", self.gate.view(), message)?;
         rec.add_into("msg_mix", kept.view(), gained.view(), out)?;
-        self.hold(forgotten);
-        self.hold(kept);
-        self.hold(gained);
+        for scratch in [forgotten, kept, gained] {
+            scheme.keep_alive(scratch);
+        }
         Ok(())
     }
 
@@ -705,9 +703,5 @@ impl DecodeLayer {
             .view()
             .narrow(0, index, 1)?
             .reshape(&[self.spec.hidden])
-    }
-
-    fn hold(&self, tensor: Tensor) {
-        self.held.lock().expect("layer scratch").push(tensor);
     }
 }

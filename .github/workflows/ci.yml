@@ -7,7 +7,8 @@
 #
 # The Rust crate path-depends on ammon and goldy as siblings. GPU tests are not
 # optional: the lavapipe job fails if the ICD is missing or is not Vulkan 1.4.
-# Goldy and Ammon are checked out from their main branches.
+# Goldy and Ammon are checked out from AMMON_REF and GOLDY_REF, which are main
+# except while a dependency pull request is open.
 # Retained command buffers keep their own frame-table rows, and a row holds
 # 32768 indices so one Mini token fits. One scheme per token, fusion on.
 
@@ -20,6 +21,12 @@ on:
   workflow_dispatch:
   repository_dispatch:
     types: [goldy_main]
+
+env:
+  # Dependency PRs: https://github.com/koubaa/Ammon/pulls (cursor/single-recording-path-06c6)
+  # and https://github.com/koubaa/goldy/pull/355. Repin both to main after they merge.
+  AMMON_REF: cursor/single-recording-path-06c6
+  GOLDY_REF: cursor/described-dispatches-06c6
 
 jobs:
   rust:
@@ -34,14 +41,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: koubaa/ammon
-          ref: main
+          ref: ${{ env.AMMON_REF }}
           path: ammon
 
       - name: Checkout goldy
         uses: actions/checkout@v4
         with:
           repository: koubaa/goldy
-          ref: main
+          ref: ${{ env.GOLDY_REF }}
           path: goldy
 
       - uses: dtolnay/rust-toolchain@stable
@@ -83,14 +90,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: koubaa/ammon
-          ref: main
+          ref: ${{ env.AMMON_REF }}
           path: ammon
 
       - name: Checkout goldy
         uses: actions/checkout@v4
         with:
           repository: koubaa/goldy
-          ref: main
+          ref: ${{ env.GOLDY_REF }}
           path: goldy
 
       - uses: dtolnay/rust-toolchain@stable
