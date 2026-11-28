@@ -266,7 +266,8 @@ fn decoder_layer_matches_pinned_module_on_replay() {
         // described as cyclic stores, so it folds into the next projection.
         // Depth mix, split-K, and the tape store stay one dispatch each. The
         // per-head L2 clips are described up to reassociation, so they fuse
-        // only under relaxed arithmetic.
+        // only under relaxed arithmetic. MatchRecorded therefore preserves
+        // four additional clip dispatches.
         assert!(has("rms_normalize"), "no fused RMS region: {report:?}");
         assert!(has("msg_forget_h"), "no fused message gate: {report:?}");
         assert!(has("swiglu"), "no fused SwiGLU: {report:?}");
@@ -276,7 +277,11 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .iter()
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
-            assert_eq!(recorded.executed_node_count(), 31, "{report:?}");
+            let expected_nodes = match ammon::inference_arithmetic_policy().unwrap() {
+                goldy::ArithmeticPolicy::MatchRecorded => 35,
+                goldy::ArithmeticPolicy::Relaxed => 31,
+            };
+            assert_eq!(recorded.executed_node_count(), expected_nodes, "{report:?}");
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let started = std::time::Instant::now();
