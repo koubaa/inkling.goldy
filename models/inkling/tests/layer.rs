@@ -212,6 +212,7 @@ fn decoder_layer_matches_pinned_module_on_replay() {
             )
             .unwrap();
         let mut recorded = Scheme::new(&ctx);
+        ammon::configure_inference_scheme(&mut recorded);
         recorded.set_automatic_fusion(true);
         layer
             .record(
@@ -265,9 +266,10 @@ fn decoder_layer_matches_pinned_module_on_replay() {
         // convolutions are cyclic row dots too, and a ring cache store is
         // described as cyclic stores, so it folds into the next projection.
         // Depth mix, split-K, and the tape store stay one dispatch each. The
-        // per-head L2 clips are described up to reassociation. Vulkan fuses
-        // their boundaries only under relaxed arithmetic; Metal's native and
-        // reduction boundaries currently preserve the same node count.
+        // per-head L2 clips and the split-attention combine are described up
+        // to reassociation. Vulkan fuses their boundaries only under relaxed
+        // arithmetic; Metal's native and reduction boundaries currently
+        // preserve the same node count.
         assert!(has("rms_normalize"), "no fused RMS region: {report:?}");
         assert!(has("msg_forget_h"), "no fused message gate: {report:?}");
         assert!(has("swiglu"), "no fused SwiGLU: {report:?}");
@@ -278,13 +280,13 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
             // Metal keeps native/reduction boundaries that leave this visit at
-            // 40 nodes under both policies. Vulkan's generated path can remove
-            // the four L2-clip boundaries when reassociation is allowed.
+            // 40 nodes under both policies. Vulkan's generated path removes the
+            // clip and combine boundaries when reassociation is allowed.
             let policy = ammon::inference_arithmetic_policy().unwrap();
             let expected_nodes = match (device.backend_type(), policy) {
                 (BackendType::Metal, _) => 40,
-                (_, goldy::ArithmeticPolicy::MatchRecorded) => 35,
-                (_, goldy::ArithmeticPolicy::Relaxed) => 31,
+                (_, goldy::ArithmeticPolicy::MatchRecorded) => 31,
+                (_, goldy::ArithmeticPolicy::Relaxed) => 28,
             };
             assert_eq!(recorded.executed_node_count(), expected_nodes, "{report:?}");
             let mut samples = Vec::new();
