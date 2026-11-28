@@ -123,9 +123,15 @@ fn mini_forward_matches_the_reference_logits() {
         "mini logits max abs {err}, limit {limit}, rms {rms}"
     );
     let stats = model.replay_stats();
+    #[cfg(not(feature = "metal"))]
     assert!(
         stats.resubmit_hits > 0,
         "token scheme did not replay: {stats:?}"
+    );
+    #[cfg(feature = "metal")]
+    assert!(
+        stats.clean_submits > 0,
+        "token scheme was not clean on replay: {stats:?}"
     );
     assert_eq!(stats.retained_evictions, 0, "{stats:?}");
 }
