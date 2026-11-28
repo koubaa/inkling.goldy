@@ -60,33 +60,37 @@ fn bench_stories15m() {
             break;
         }
     }
-    let pending = model.compiles_pending();
     let settle = env_steps("AMMON_BENCH_SETTLE_STEPS", 0);
     for _ in 0..settle {
         step(&mut model);
     }
-    let settled_pending = model.compiles_pending();
+    assert!(
+        !model.compiles_pending(),
+        "a compile is still pending after {settle} settle steps"
+    );
     let timed = env_steps("AMMON_BENCH_TIMED_STEPS", seq);
     let before = model.replay_stats();
     let cpu_before = thread_cpu_ns();
     let mut times: Vec<f64> = (0..timed).map(|_| step(&mut model)).collect();
     let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(timed);
     let after = model.replay_stats();
+    let records = after.records - before.records;
+    assert_eq!(records, 0, "the timed window re-recorded a scheme");
+    let raw: Vec<String> = times.iter().map(|t| format!("{:.4}", t * 1e3)).collect();
     times.sort_by(f64::total_cmp);
-    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
     println!(
-        "BENCH stories15M arithmetic_policy={} lp_threads={} warm_steps={warm_steps} pending={pending} \
-         settle={settle} settled_pending={settled_pending} timed={timed} executed_nodes/token={} fused_regions={} records={} clean_submits/token={:.1} \
-         mean {:.2} ms ({:.1} tok/s) median {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
+        "BENCH stories15M arithmetic_policy={} lp_threads={} warm_steps={warm_steps} \
+         settle={settle} timed={timed} records={records} executed_nodes/token={} fused_regions={} \
+         clean_submits/token={:.1} tok/s p10 {:.2} median {:.2} p90 {:.2} host_cpu {host_ms:.2} ms",
         std::env::var("AMMON_ARITHMETIC_POLICY").unwrap_or_else(|_| "default".into()),
         std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
         model.executed_node_count(),
         model.fusion_report().regions.len(),
-        after.records - before.records,
         (after.clean_submits - before.clean_submits) as f64 / f64::from(timed),
-        mean * 1e3,
-        1.0 / mean,
-        times[times.len() / 2] * 1e3,
-        times[0] * 1e3,
+        1.0 / at(0.9),
+        1.0 / at(0.5),
+        1.0 / at(0.1),
     );
+    println!("STEP_MS stories15M {}", raw.join(","));
 }

@@ -94,9 +94,8 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
         if !pending && warm_steps >= 2 * seq {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
-    let (schemes, nodes, pending) = model.replay_census().unwrap();
+    let (schemes, nodes, _) = model.replay_census().unwrap();
     if let Ok(which) = std::env::var("INKLING_FUSION_REPORT") {
         let index: usize = which.parse().unwrap();
         if let Some((report, executed)) = model.visit_fusion(index) {
@@ -136,6 +135,10 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
         step(&mut model);
     }
     let (_, _, settled_pending) = model.replay_census().unwrap();
+    assert!(
+        !settled_pending,
+        "a compile is still pending after {settle} settle steps"
+    );
     let timed = env_steps("AMMON_BENCH_TIMED_STEPS", 4 * seq);
     let before = model.replay_totals().unwrap();
     let cpu_before = thread_cpu_ns();
@@ -143,6 +146,8 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
     let host_ms = (thread_cpu_ns() - cpu_before) as f64 / 1e6 / f64::from(timed);
     let after = model.replay_totals().unwrap();
     let per = |i: usize| (after[i] - before[i]) as f64 / f64::from(timed);
+    let records = after[0] - before[0];
+    assert_eq!(records, 0, "the timed window re-recorded a scheme");
     println!(
         "per token: records {:.1} topology_records {:.1} clean_submits {:.1} resubmit_hits {:.1} evictions {:.1}",
         per(0),
@@ -151,20 +156,21 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
         per(3),
         per(4)
     );
+    let raw: Vec<String> = times.iter().map(|t| format!("{:.4}", t * 1e3)).collect();
     times.sort_by(f64::total_cmp);
-    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
     println!(
         "BENCH {name} arithmetic_policy={} lp_threads={} warm_steps={warm_steps} \
-         pending={pending} settle={settle} settled_pending={settled_pending} timed={timed} \
+         settle={settle} timed={timed} records={records} \
          submits/token={schemes} executed_nodes/token={nodes} \
-         mean {:.2} ms ({:.2} tok/s) median {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
+         tok/s p10 {:.2} median {:.2} p90 {:.2} host_cpu {host_ms:.2} ms",
         std::env::var("AMMON_ARITHMETIC_POLICY").unwrap_or_else(|_| "default".into()),
         std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
-        mean * 1e3,
-        1.0 / mean,
-        times[times.len() / 2] * 1e3,
-        times[0] * 1e3,
+        1.0 / at(0.9),
+        1.0 / at(0.5),
+        1.0 / at(0.1),
     );
+    println!("STEP_MS {name} {}", raw.join(","));
 }
 
 #[test]

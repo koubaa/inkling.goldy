@@ -1,4 +1,5 @@
-# Paired Metal decode benchmark: A is current main (Goldy main + #370 for the
+# Paired steady-state Metal decode benchmark under Ammon's inference policy
+# (relaxed): A is current main (Goldy main + #370 for the
 # Metal bindless capacity, Ammon main + #29 for the policy switch), B is every
 # open Goldy and Ammon PR merged together. Both build this branch's models. See
 # .github/bench/abba.sh for the run order.
@@ -14,8 +15,8 @@ env:
   A_AMMON: 8701a25bd144d80ca0a48f61323e75f9fac85405
   B_GOLDY: 949e05d0526c59c04196d533bd0d6c33f8ed2999
   B_AMMON: eb999609948ce8ff24de9ec9095a0f8549362a9f
-  AMMON_BENCH_SETTLE_STEPS: "64"
-  AMMON_BENCH_TIMED_STEPS: "256"
+  AMMON_BENCH_SETTLE_STEPS: "128"
+  AMMON_BENCH_TIMED_STEPS: "512"
   ROUNDS: "3"
 
 jobs:
@@ -70,11 +71,14 @@ jobs:
       - name: Paired runs
         run: |
           set -euo pipefail
-          bash a/ammon-models/.github/bench/abba.sh bin "$ROUNDS" | tee bench.log
+          bash a/ammon-models/.github/bench/abba.sh bin "$ROUNDS" > bench.log
+          grep -v '^RUN .* STEP_MS' bench.log
+          python3 a/ammon-models/.github/bench/summarize.py bench.log main stack | tee summary.md
           {
-            echo "### Metal, A = main, B = open PRs (settle $AMMON_BENCH_SETTLE_STEPS, timed $AMMON_BENCH_TIMED_STEPS, $ROUNDS ABBA rounds)"
-            python3 a/ammon-models/.github/bench/summarize.py bench.log main stack
+            echo "### Metal, relaxed: main vs open PRs (settle $AMMON_BENCH_SETTLE_STEPS, timed $AMMON_BENCH_TIMED_STEPS, $ROUNDS ABBA rounds)"
+            cat summary.md
           } >> "$GITHUB_STEP_SUMMARY"
+          ! grep -q FAILED summary.md
       - uses: actions/upload-artifact@v4
         if: always()
         with:
