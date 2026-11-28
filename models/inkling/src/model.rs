@@ -212,9 +212,9 @@ impl TextModel {
             message_query,
             lm_head_w,
             embedder: Embedding::new(runtime)?,
-            norm: RmsNorm::with_eps(runtime, spec.scalars.rms_eps)?,
+            norm: RmsNorm::with_eps(runtime, spec.hidden, spec.scalars.rms_eps)?,
             head: Linear::new(runtime)?,
-            softcap: Softcap::new(runtime, spec.logit_cap)?,
+            softcap: Softcap::new(runtime, spec.vocab, spec.logit_cap)?,
             depth: DepthMix::new(runtime)?,
             ops: TensorKernels::new(runtime)?,
         })
@@ -246,11 +246,15 @@ impl TextModel {
     /// submits, resubmit hits and retained evictions.
     pub fn replay_totals(&self) -> Option<[u64; 5]> {
         let stats = self.graph.as_ref()?.token.replay_stats();
+        #[cfg(not(feature = "metal"))]
+        let resubmit_hits = stats.resubmit_hits;
+        #[cfg(feature = "metal")]
+        let resubmit_hits = 0;
         Some([
             stats.records,
             stats.topology_records,
             stats.clean_submits,
-            stats.resubmit_hits,
+            resubmit_hits,
             stats.retained_evictions,
         ])
     }

@@ -68,7 +68,7 @@ impl DecoderModules {
                 shape.n_kv_heads,
                 shape.head_size,
             )?,
-            final_norm: RmsNorm::new(runtime)?,
+            final_norm: RmsNorm::new(runtime, shape.dim)?,
             lm_head: Linear::new(runtime)?,
         })
     }
