@@ -15,13 +15,13 @@ MODELS = ROOT / "models"
 # One tokenizer + one llama2.c blob per model, consumed by every engine.
 ASSETS: dict[str, dict[str, object]] = {
     "tokenizer.bin": {
-        "url": "https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin",
+        "url": "https://github.com/karpathy/llama2.c/raw/350e04fe35433e6d2941dce5a1f53308f87058eb/tokenizer.bin",
         "sha256": "50a52ef822ee9e83de5ce9d0be0a025a773d019437f58b5ff9dcafb063ece361",
         "min_bytes": 100_000,
         "required": True,
     },
     "stories15M.bin": {
-        "url": "https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin",
+        "url": "https://huggingface.co/karpathy/tinyllamas/resolve/0bd21da7698eaf29a0d7de3992de8a46ef624add/stories15M.bin",
         "sha256": "cd590644d963867a2b6e5a1107f51fad663c41d79c149fbecbbb1f95fa81f49a",
         "bytes": 60_816_028,
         "config": {
@@ -36,7 +36,7 @@ ASSETS: dict[str, dict[str, object]] = {
         "required": True,
     },
     "stories42M.bin": {
-        "url": "https://huggingface.co/karpathy/tinyllamas/resolve/main/stories42M.bin",
+        "url": "https://huggingface.co/karpathy/tinyllamas/resolve/0bd21da7698eaf29a0d7de3992de8a46ef624add/stories42M.bin",
         "sha256": "9f65a1000e17d0bc167dd6332e0ce5119a0222a3d920cead5bce413bfab2ee7b",
         "bytes": 167_020_572,
         "config": {
@@ -51,7 +51,7 @@ ASSETS: dict[str, dict[str, object]] = {
         "required": False,
     },
     "stories110M.bin": {
-        "url": "https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin",
+        "url": "https://huggingface.co/karpathy/tinyllamas/resolve/0bd21da7698eaf29a0d7de3992de8a46ef624add/stories110M.bin",
         "sha256": "515267168726a1ed1317a64a408492e6af3b67c1f71c5bd98c01d9d721803a24",
         "bytes": 438_381_596,
         "config": {
