@@ -23,10 +23,9 @@ on:
     types: [goldy_main]
 
 env:
-  # Dependency PRs: https://github.com/koubaa/Ammon/pulls (cursor/single-recording-path-06c6)
-  # and https://github.com/koubaa/goldy/pull/355. Repin both to main after they merge.
-  AMMON_REF: cursor/single-recording-path-06c6
-  GOLDY_REF: cursor/described-dispatches-06c6
+  # Dependency PR: https://github.com/koubaa/Ammon/pull/23. Repin to main after it merges.
+  AMMON_REF: cursor/kv-conv-algebra-06c6
+  GOLDY_REF: main
 
 jobs:
   rust:
