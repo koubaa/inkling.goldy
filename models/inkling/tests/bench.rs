@@ -199,6 +199,71 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
         p90 * 1e3,
         times[0] * 1e3,
     );
+
+    let prefill_warm = Instant::now();
+    let mut prefill_warm_steps = 0u32;
+    while prefill_warm.elapsed() < Duration::from_secs(120) {
+        for _ in 0..seq.max(4) {
+            model.advance(1 + pos % 7, pos).unwrap();
+            pos = (pos + 1) % seq;
+            prefill_warm_steps += 1;
+        }
+        ctx.wait_until_idle().unwrap();
+        let (_, _, pending) = model.prefill_replay_census().unwrap();
+        if !pending && prefill_warm_steps >= 2 * seq {
+            break;
+        }
+    }
+    for _ in 0..settle_steps {
+        model.advance(1 + pos % 7, pos).unwrap();
+        pos = (pos + 1) % seq;
+    }
+    ctx.wait_until_idle().unwrap();
+    while prefill_warm.elapsed() < Duration::from_secs(120) {
+        let (_, _, pending) = model.prefill_replay_census().unwrap();
+        if !pending {
+            break;
+        }
+        model.advance(1 + pos % 7, pos).unwrap();
+        pos = (pos + 1) % seq;
+        ctx.wait_until_idle().unwrap();
+    }
+    let (prefill_schemes, prefill_nodes, prefill_pending) = model.prefill_replay_census().unwrap();
+    assert!(
+        !prefill_pending,
+        "prefill compiles still pending after warmup and settle"
+    );
+    let prefill_before = model.prefill_replay_totals().unwrap();
+    let prefill_cpu_before = thread_cpu_ns();
+    let prefill_wall = Instant::now();
+    for _ in 0..timed_steps {
+        model.advance(1 + pos % 7, pos).unwrap();
+        pos = (pos + 1) % seq;
+    }
+    ctx.wait_until_idle().unwrap();
+    let prefill_elapsed = prefill_wall.elapsed().as_secs_f64();
+    let prefill_host_ms =
+        (thread_cpu_ns() - prefill_cpu_before) as f64 / 1e6 / f64::from(timed_steps);
+    let prefill_after = model.prefill_replay_totals().unwrap();
+    let prefill_records = prefill_after[0] - prefill_before[0];
+    let prefill_topology = prefill_after[1] - prefill_before[1];
+    assert_eq!(
+        prefill_records, 0,
+        "prefill steady-state window recorded {prefill_records} times"
+    );
+    assert_eq!(
+        prefill_topology, 0,
+        "prefill steady-state window re-recorded topology {prefill_topology} times"
+    );
+    let prefill_mean = prefill_elapsed / f64::from(timed_steps);
+    println!(
+        "BENCH {name}_prefill lp_threads={} warm_steps={prefill_warm_steps} settle_steps={settle_steps} timed_steps={timed_steps} \
+         submits/token={prefill_schemes} executed_nodes/token={prefill_nodes} records={prefill_records} \
+         mean {:.2} ms ({:.2} tok/s) host_cpu {prefill_host_ms:.2} ms",
+        std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
+        prefill_mean * 1e3,
+        1.0 / prefill_mean,
+    );
 }
 
 #[test]
