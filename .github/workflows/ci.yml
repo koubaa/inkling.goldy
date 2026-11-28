@@ -23,8 +23,7 @@ on:
     types: [goldy_main]
 
 env:
-  # Dependency PR: https://github.com/koubaa/Ammon/pull/23. Repin to main after it merges.
-  AMMON_REF: cursor/kv-conv-algebra-06c6
+  AMMON_REF: main
   GOLDY_REF: main
 
 jobs:
