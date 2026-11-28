@@ -9,11 +9,11 @@ pub mod packed;
 pub mod tape;
 pub mod tokenizer;
 
-#[cfg(feature = "vulkan")]
+#[cfg(feature = "gpu")]
 pub mod generate;
-#[cfg(feature = "vulkan")]
+#[cfg(feature = "gpu")]
 pub mod layer;
-#[cfg(feature = "vulkan")]
+#[cfg(feature = "gpu")]
 pub mod model;
 
 /// Path of the reference harness, relative to the crate root.

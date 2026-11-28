@@ -2,7 +2,7 @@
 //! `INKLING_REAL_PACK` points at a directory written by
 //! `tools/check_packed_parity.py`.
 
-#![cfg(feature = "vulkan")]
+#![cfg(feature = "gpu")]
 
 use ammon::checkpoint::MappedCheckpoint;
 use ammon::gpu::create_runtime;

@@ -3,7 +3,7 @@
 //! `tests/data/mini_model.safetensors` is the module state dict.
 //! `tests/data/mini_forward.bin` is the compact golden: header, token ids, logits.
 
-#![cfg(feature = "vulkan")]
+#![cfg(feature = "gpu")]
 
 use ammon::gpu::create_serial_runtime as create_runtime;
 use inkling_goldy::layer::DecodeLayerScalars;

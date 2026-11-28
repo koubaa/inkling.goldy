@@ -61,9 +61,10 @@ fn bench_stories15m() {
     times.sort_by(f64::total_cmp);
     let mean = times.iter().sum::<f64>() / times.len() as f64;
     println!(
-        "BENCH stories15M lp_threads={} warm_steps={warm_steps} pending={pending} \
+        "BENCH stories15M arithmetic_policy={} lp_threads={} warm_steps={warm_steps} pending={pending} \
          executed_nodes/token={} fused_regions={} records={} resubmit_hits/token={:.1} \
          mean {:.2} ms ({:.1} tok/s) median {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
+        std::env::var("AMMON_ARITHMETIC_POLICY").unwrap_or_else(|_| "default".into()),
         std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
         model.executed_node_count(),
         model.fusion_report().regions.len(),

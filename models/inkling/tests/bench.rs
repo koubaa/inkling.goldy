@@ -1,5 +1,5 @@
 //! Steady-state replay timing. Ignored by default; run with
-//! `cargo test --release --features vulkan --test bench -- --ignored --nocapture --test-threads=1`.
+//! `cargo test --release --features <backend> --test bench -- --ignored --nocapture --test-threads=1`.
 //!
 //! Each step cycles positions `0..seq`, so attention length averages over the window.
 //! Timing starts once no scheme has a fusion or specialization compile outstanding; on
@@ -10,7 +10,7 @@
 //! touching `/tmp/inkling_steady` when it starts. `host_cpu` is the stepping thread's CPU
 //! time per token, so it separates submit cost from waiting on the device.
 
-#![cfg(feature = "vulkan")]
+#![cfg(feature = "gpu")]
 
 use ammon::gpu::create_runtime;
 use inkling_goldy::layer::DecodeLayerScalars;
@@ -139,9 +139,10 @@ fn run(name: &str, spec: ForwardSpec, weights: &[u8]) {
     times.sort_by(f64::total_cmp);
     let mean = times.iter().sum::<f64>() / times.len() as f64;
     println!(
-        "BENCH {name} lp_threads={} warm_steps={warm_steps} \
+        "BENCH {name} arithmetic_policy={} lp_threads={} warm_steps={warm_steps} \
          pending={pending} submits/token={schemes} executed_nodes/token={nodes} \
          mean {:.2} ms ({:.2} tok/s) median {:.2} ms min {:.2} ms host_cpu {host_ms:.2} ms",
+        std::env::var("AMMON_ARITHMETIC_POLICY").unwrap_or_else(|_| "default".into()),
         std::env::var("LP_NUM_THREADS").unwrap_or_else(|_| "default".into()),
         mean * 1e3,
         1.0 / mean,

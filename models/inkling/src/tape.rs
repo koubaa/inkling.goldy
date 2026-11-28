@@ -116,7 +116,7 @@ mod tests {
 /// [`Self::blocks`] at [`Self::len`]; [`Self::commit_written_row`] counts it
 /// and does not copy it. Snapshot and restore are how a later loop pass
 /// returns to the pre-loop prefix.
-#[cfg(feature = "vulkan")]
+#[cfg(feature = "gpu")]
 pub struct DepthTape {
     blocks: goldy::Tensor,
     len: u32,
@@ -124,7 +124,7 @@ pub struct DepthTape {
     snapshot: Option<u32>,
 }
 
-#[cfg(feature = "vulkan")]
+#[cfg(feature = "gpu")]
 impl DepthTape {
     pub fn new(runtime: &goldy::Runtime, capacity: u32, hidden: u32) -> anyhow::Result<Self> {
         let blocks = goldy::Tensor::zeros(
@@ -172,7 +172,7 @@ impl DepthTape {
     }
 }
 
-#[cfg(all(test, feature = "vulkan"))]
+#[cfg(all(test, feature = "gpu"))]
 mod owner {
     use super::*;
 

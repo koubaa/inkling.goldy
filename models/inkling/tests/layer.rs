@@ -3,7 +3,7 @@
 //! `tests/data/decoder_layer.safetensors` is the layer `state_dict`.
 //! `tests/data/layer_goldens.bin` is the activations. Max abs error is at most 1e-5.
 
-#![cfg(feature = "vulkan")]
+#![cfg(feature = "gpu")]
 
 use ammon::gpu::create_runtime;
 use ammon::kernels::DecodeStep;
