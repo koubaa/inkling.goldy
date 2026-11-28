@@ -7,18 +7,18 @@
 //! restore the pre-loop hidden state.
 
 use crate::layer::{
-    DecodeLayer, DecodeLayerScalars, DecodeLayerWeights, WeightSlabBuilder, WeightSlice,
+    DecodeLayerScalars, DecodeLayerWeights, SharedLayerModules, WeightSlabBuilder, WeightSlice,
 };
 use crate::names::{load_decode_layer, DecodeLayerSpec};
 use crate::tape::{blocks_before, message_key_start, LoopSchedule};
 use ammon::{
-    configure_inference_scheme, DecodeLayerState, DecodeLayerStateSpec, DepthMix, Embedding,
-    Linear, LogitsView, RmsNorm, Softcap, DEPTH_RMS_EPS,
+    configure_inference_scheme, DecodeLayerState, DecodeLayerStateSpec, Embedding, LogitsView,
+    Softcap, DEPTH_RMS_EPS,
 };
 use anyhow::{bail, Context, Result};
 use goldy::{
     Buffer, BufferKind, Context as GoldyContext, GoldyError, MemoryExchange, Runtime, Scheme,
-    Tensor, TensorDType, TensorKernels, TensorShape, TensorView,
+    Tensor, TensorDType, TensorShape, TensorView,
 };
 use safetensors::{Dtype, SafeTensors};
 use std::sync::Arc;
@@ -74,7 +74,8 @@ struct Graph {
 /// Device weights and one recorded token of the Mini schedule.
 pub struct TextModel {
     graph: Option<Graph>,
-    layers: Vec<DecodeLayer>,
+    modules: SharedLayerModules,
+    layer_configs: Vec<(DecodeLayerSpec, DecodeLayerScalars)>,
     weights: Vec<DecodeLayerWeights>,
     spec: ForwardSpec,
     runtime: Runtime,
@@ -86,11 +87,7 @@ pub struct TextModel {
     message_query: Option<WeightSlice>,
     lm_head_w: WeightSlice,
     embedder: Embedding,
-    norm: RmsNorm,
-    head: Linear,
     softcap: Softcap,
-    depth: DepthMix,
-    ops: TensorKernels,
 }
 
 impl ammon::AutoregressiveModel for TextModel {
@@ -171,7 +168,7 @@ impl TextModel {
             )?)
         };
 
-        let mut layers = Vec::with_capacity(spec.schedule.layers as usize);
+        let mut layer_configs = Vec::with_capacity(spec.schedule.layers as usize);
         let mut packed_layers = Vec::with_capacity(spec.schedule.layers as usize);
         for layer in 0..spec.schedule.layers {
             let full = spec.schedule.is_full(layer);
@@ -203,9 +200,10 @@ impl TextModel {
             let host = load_decode_layer(weights, &format!("model.layers.{layer}."), layer_spec)
                 .with_context(|| format!("layer {layer}"))?;
             packed_layers.push(DecodeLayerWeights::pack(&mut builder, layer_spec, &host)?);
-            layers.push(DecodeLayer::new(runtime, layer_spec, scalars)?);
+            layer_configs.push((layer_spec, scalars));
         }
 
+        let modules = SharedLayerModules::new(runtime, &layer_configs)?;
         let weight_slab = builder.finish(runtime)?;
         let layer_weights = packed_layers
             .into_iter()
@@ -214,7 +212,8 @@ impl TextModel {
 
         Ok(Self {
             graph: None,
-            layers,
+            modules,
+            layer_configs,
             weights: layer_weights,
             spec,
             runtime: runtime.clone(),
@@ -226,11 +225,7 @@ impl TextModel {
             message_query,
             lm_head_w,
             embedder: Embedding::new(runtime)?,
-            norm: RmsNorm::with_eps(runtime, spec.hidden, spec.scalars.rms_eps)?,
-            head: Linear::new(runtime)?,
             softcap: Softcap::new(runtime, spec.vocab, spec.logit_cap)?,
-            depth: DepthMix::new(runtime)?,
-            ops: TensorKernels::new(runtime)?,
         })
     }
 
@@ -395,10 +390,11 @@ impl TextModel {
             ammon::kernels::DecodeStep::deposit_target(&step),
         )?;
         let slab = self.weight_slab.as_ref();
+        let modules = &self.modules;
         let embedder = &self.embedder;
         let embed_table = self.embed_table.view(slab);
         let embed_norm_w = self.embed_norm_w.view(slab);
-        let norm = &self.norm;
+        let norm = modules.norm();
         token.group("embed", |scheme| {
             let embed_raw =
                 scheme.temporary_tensor(TensorShape::vector(hidden), TensorDType::F32)?;
@@ -426,12 +422,13 @@ impl TextModel {
                 } else {
                     None
                 };
-                let layer = &self.layers[visit.layer as usize];
+                let (layer_spec, _) = self.layer_configs[visit.layer as usize];
                 let weights = &self.weights[visit.layer as usize];
                 let state = &states[index];
                 token.group(format!("visit-{index}"), |scheme| {
-                    layer.record(
+                    modules.record_layer(
                         scheme,
+                        layer_spec,
                         src,
                         tape.view(),
                         n_blocks,
@@ -450,13 +447,13 @@ impl TextModel {
             src_is_h = record_visit(&mut token, visit_at, visit, src_is_h)?;
             visit_at += 1;
         }
-        let ops = &self.ops;
+        let ops = modules.ops();
         token.group("snap", |scheme| {
             ops.recorder(scheme)
                 .copy("snap_hidden", h.view(), h_snap.view())
         })?;
-        let depth = &self.depth;
-        let scale = (f64::from(hidden)).powf(-0.5) as f32;
+        let depth = modules.depth();
+        let scale = modules.scale();
         for pass in 0..schedule.passes {
             if pass > 0 {
                 token.group(format!("keys-{pass}"), |scheme| {
@@ -520,7 +517,7 @@ impl TextModel {
         let final_query = self.final_query.view(slab);
         let final_norm_w = self.final_norm_w.view(slab);
         let lm_head_w = self.lm_head_w.view(slab);
-        let head = &self.head;
+        let head = modules.linear();
         let softcap = &self.softcap;
         token.group("finish", |scheme| {
             let f = TensorDType::F32;

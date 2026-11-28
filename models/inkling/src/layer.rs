@@ -309,97 +309,196 @@ impl DecodeLayerWeights {
     }
 }
 
-/// Stateless child modules for one decoder layer configuration.
-pub struct DecodeLayer {
-    spec: DecodeLayerSpec,
-    depth: DepthMix,
-    post: ShortConv,
-    ops: goldy::TensorKernels,
-    attn: DecodeAttention,
+/// Stateless child modules shared across every decoder layer in a model.
+///
+/// Mirrors `llama3`'s `DecoderModules`: pipelines and unit buffers are prepared
+/// once on the runtime, while per-layer structural flags (`full`, `layer_index`,
+/// `boundary`, `messages`) and scalars stay plain host descriptors.
+pub struct SharedLayerModules {
+    sliding_attn: Option<DecodeAttention>,
+    full_attn: Option<DecodeAttention>,
     moe: DecodeMoe,
     norm: RmsNorm,
     linear: Linear,
     tanh: Softcap,
+    depth: DepthMix,
+    post: ShortConv,
+    ops: goldy::TensorKernels,
+    hidden: u32,
+    gate_rank: u32,
     scale: f32,
 }
 
-impl DecodeLayer {
+fn build_attention(
+    runtime: &Runtime,
+    spec: DecodeLayerSpec,
+    scalars: DecodeLayerScalars,
+) -> anyhow::Result<DecodeAttention> {
+    let kind = if spec.full {
+        DecodeAttentionKind::Full
+    } else {
+        if spec.window == 0 {
+            anyhow::bail!("sliding decoder layer needs a window");
+        }
+        DecodeAttentionKind::Sliding {
+            window: spec.window,
+        }
+    };
+    let log = if scalars.log_alpha != 0.0 {
+        Some(LogPositionScale {
+            alpha: scalars.log_alpha,
+            floor: scalars.log_floor,
+        })
+    } else {
+        None
+    };
+    DecodeAttention::new(
+        runtime,
+        kind,
+        spec.q_heads,
+        spec.kv_heads,
+        spec.head_dim,
+        spec.hidden,
+        spec.d_rel,
+        spec.rel_extent,
+        spec.conv_kernel,
+        spec.dynamic_conv,
+        scalars.qk_clip,
+        scalars.rel_clip,
+        scalars.rms_eps,
+        log,
+    )
+}
+
+fn same_attn_config(
+    a: (DecodeLayerSpec, DecodeLayerScalars),
+    b: (DecodeLayerSpec, DecodeLayerScalars),
+) -> bool {
+    a.0.full == b.0.full
+        && a.0.dynamic_conv == b.0.dynamic_conv
+        && a.0.hidden == b.0.hidden
+        && a.0.q_heads == b.0.q_heads
+        && a.0.kv_heads == b.0.kv_heads
+        && a.0.head_dim == b.0.head_dim
+        && a.0.d_rel == b.0.d_rel
+        && a.0.rel_extent == b.0.rel_extent
+        && a.0.conv_kernel == b.0.conv_kernel
+        && a.0.window == b.0.window
+        && a.1.qk_clip.to_bits() == b.1.qk_clip.to_bits()
+        && a.1.rel_clip.to_bits() == b.1.rel_clip.to_bits()
+        && a.1.rms_eps.to_bits() == b.1.rms_eps.to_bits()
+        && a.1.log_alpha.to_bits() == b.1.log_alpha.to_bits()
+        && (a.1.log_alpha == 0.0 || a.1.log_floor.to_bits() == b.1.log_floor.to_bits())
+}
+
+fn same_shared_config(
+    a: (DecodeLayerSpec, DecodeLayerScalars),
+    b: (DecodeLayerSpec, DecodeLayerScalars),
+) -> bool {
+    a.0.hidden == b.0.hidden
+        && a.0.post_kernel == b.0.post_kernel
+        && a.0.experts == b.0.experts
+        && a.0.top_k == b.0.top_k
+        && a.0.intermediate == b.0.intermediate
+        && a.0.gate_rank == b.0.gate_rank
+        && a.1.rms_eps.to_bits() == b.1.rms_eps.to_bits()
+        && a.1.route_scale.to_bits() == b.1.route_scale.to_bits()
+        && a.1.gate_cap.to_bits() == b.1.gate_cap.to_bits()
+        && a.1.up_cap.to_bits() == b.1.up_cap.to_bits()
+}
+
+impl SharedLayerModules {
     pub fn new(
         runtime: &Runtime,
-        spec: DecodeLayerSpec,
-        scalars: DecodeLayerScalars,
+        configs: &[(DecodeLayerSpec, DecodeLayerScalars)],
     ) -> anyhow::Result<Self> {
-        let kind = if spec.full {
-            DecodeAttentionKind::Full
-        } else {
-            if spec.window == 0 {
-                anyhow::bail!("sliding decoder layer needs a window");
+        let &(first_spec, first_scalars) = configs
+            .first()
+            .context("SharedLayerModules requires at least one layer spec")?;
+        let mut sliding_cfg: Option<(DecodeLayerSpec, DecodeLayerScalars)> = None;
+        let mut full_cfg: Option<(DecodeLayerSpec, DecodeLayerScalars)> = None;
+        for &(spec, scalars) in configs {
+            if !same_shared_config((first_spec, first_scalars), (spec, scalars)) {
+                anyhow::bail!(
+                    "layer {} does not match shared model dimensions/scalars",
+                    spec.layer_index
+                );
             }
-            DecodeAttentionKind::Sliding {
-                window: spec.window,
+            let slot = if spec.full {
+                &mut full_cfg
+            } else {
+                &mut sliding_cfg
+            };
+            if let Some(prev) = *slot {
+                if !same_attn_config(prev, (spec, scalars)) {
+                    anyhow::bail!(
+                        "layer {} attention config differs from earlier {} layer",
+                        spec.layer_index,
+                        if spec.full { "full" } else { "sliding" }
+                    );
+                }
+            } else {
+                *slot = Some((spec, scalars));
             }
-        };
-        let log = if scalars.log_alpha != 0.0 {
-            Some(LogPositionScale {
-                alpha: scalars.log_alpha,
-                floor: scalars.log_floor,
-            })
-        } else {
-            None
-        };
-        let hidden = spec.hidden;
+        }
+        let sliding_attn = sliding_cfg
+            .map(|(spec, scalars)| build_attention(runtime, spec, scalars))
+            .transpose()?;
+        let full_attn = full_cfg
+            .map(|(spec, scalars)| build_attention(runtime, spec, scalars))
+            .transpose()?;
+        let hidden = first_spec.hidden;
         Ok(Self {
-            attn: DecodeAttention::new(
-                runtime,
-                kind,
-                spec.q_heads,
-                spec.kv_heads,
-                spec.head_dim,
-                hidden,
-                spec.d_rel,
-                spec.rel_extent,
-                spec.conv_kernel,
-                spec.dynamic_conv,
-                scalars.qk_clip,
-                scalars.rel_clip,
-                scalars.rms_eps,
-                log,
-            )?,
+            sliding_attn,
+            full_attn,
             moe: DecodeMoe::new(
                 runtime,
-                spec.experts,
-                spec.top_k,
+                first_spec.experts,
+                first_spec.top_k,
                 hidden,
-                spec.intermediate,
-                scalars.route_scale,
-                scalars.gate_cap,
-                scalars.up_cap,
+                first_spec.intermediate,
+                first_scalars.route_scale,
+                first_scalars.gate_cap,
+                first_scalars.up_cap,
             )?,
-            norm: RmsNorm::with_eps(runtime, hidden, scalars.rms_eps)?,
+            norm: RmsNorm::with_eps(runtime, hidden, first_scalars.rms_eps)?,
             linear: Linear::new(runtime)?,
             tanh: Softcap::new(runtime, hidden, 1.0)?,
             depth: DepthMix::new(runtime)?,
-            post: ShortConv::stateless(runtime, hidden, spec.post_kernel)?,
+            post: ShortConv::stateless(runtime, hidden, first_spec.post_kernel)?,
             ops: goldy::TensorKernels::new(runtime)?,
+            hidden,
+            gate_rank: first_spec.gate_rank,
             scale: (f64::from(hidden)).powf(-0.5) as f32,
-            spec,
         })
     }
 
-    pub fn spec(&self) -> DecodeLayerSpec {
-        self.spec
+    pub(crate) fn norm(&self) -> &RmsNorm {
+        &self.norm
     }
 
-    /// Record the layer. `blocks` is `[capacity, hidden]` and the first
-    /// `n_blocks` rows are valid. A boundary layer writes the layer input into
-    /// row `n_blocks` so the MLP mix can see it; that write stays in `blocks`.
-    ///
-    /// `messages`, when this layer was built with them, is query, key, value,
-    /// and MLP, each `[hidden]`. `step.position` is the token position.
+    pub(crate) fn linear(&self) -> &Linear {
+        &self.linear
+    }
+
+    pub(crate) fn depth(&self) -> &DepthMix {
+        &self.depth
+    }
+
+    pub(crate) fn ops(&self) -> &goldy::TensorKernels {
+        &self.ops
+    }
+
+    pub(crate) fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Record one layer visit using `spec` and per-visit `weights` / `state`.
     #[allow(clippy::too_many_arguments)]
-    pub fn record(
+    pub fn record_layer(
         &self,
         scheme: &mut Scheme,
+        spec: DecodeLayerSpec,
         hidden: TensorView<'_>,
         blocks: TensorView<'_>,
         n_blocks: u32,
@@ -409,7 +508,12 @@ impl DecodeLayer {
         step: &Buffer,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        let h = self.spec.hidden;
+        let h = self.hidden;
+        if spec.hidden != h || spec.gate_rank != self.gate_rank {
+            return Err(GoldyError::Validation(
+                "decoder layer spec does not match shared layer modules".into(),
+            ));
+        }
         if hidden.shape().dims() != [h] || out.shape().dims() != [h] {
             return Err(GoldyError::Validation(
                 "decoder layer hidden and out are [hidden]".into(),
@@ -421,27 +525,35 @@ impl DecodeLayer {
             ));
         }
         let capacity = blocks.shape().dim(0)?;
-        let mlp_blocks = n_blocks + u32::from(self.spec.boundary);
+        let mlp_blocks = n_blocks + u32::from(spec.boundary);
         if mlp_blocks > capacity {
             return Err(GoldyError::Validation(
                 "decoder layer block tape is shorter than the boundary append".into(),
             ));
         }
-        if messages.is_some() && !self.spec.messages {
+        if messages.is_some() && !spec.messages {
             return Err(GoldyError::Validation(
                 "decoder layer has no message gates for this visit".into(),
             ));
         }
+        let attn = if spec.full {
+            self.full_attn.as_ref().ok_or_else(|| {
+                GoldyError::Validation("shared layer modules have no full attention".into())
+            })?
+        } else {
+            self.sliding_attn.as_ref().ok_or_else(|| {
+                GoldyError::Validation("shared layer modules have no sliding attention".into())
+            })?
+        };
         let f = TensorDType::F32;
         let vec_h = || TensorShape::vector(h);
         let slab = weights.slab.as_ref();
         let ws = &weights.slices;
 
-        let (qn, kn, vn) =
-            self.prepare_attention_streams(scheme, hidden, blocks, n_blocks, messages, weights)?;
+        let (qn, kn, vn) = self
+            .prepare_attention_streams(scheme, spec, hidden, blocks, n_blocks, messages, weights)?;
         let attn_out = scheme.temporary_tensor(vec_h(), f)?;
-        self.attn
-            .record(scheme, qn, kn, vn, weights.views(), state, step, attn_out)?;
+        attn.record(scheme, qn, kn, vn, weights.views(), state, step, attn_out)?;
         let post_attn = state.post_attn().ok_or_else(|| {
             GoldyError::Validation("visit is missing the post-attention conv ring".into())
         })?;
@@ -454,7 +566,7 @@ impl DecodeLayer {
             step,
             conv_attn,
         )?;
-        let mlp_partial = if self.spec.boundary {
+        let mlp_partial = if spec.boundary {
             self.depth.store_row(scheme, hidden, blocks, n_blocks)?;
             conv_attn
         } else {
@@ -512,9 +624,11 @@ impl DecodeLayer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_attention_streams(
         &self,
         scheme: &mut Scheme,
+        spec: DecodeLayerSpec,
         hidden: TensorView<'_>,
         blocks: TensorView<'_>,
         n_blocks: u32,
@@ -528,17 +642,17 @@ impl DecodeLayer {
         ),
         GoldyError,
     > {
-        let h = self.spec.hidden;
+        let h = self.hidden;
         let f = TensorDType::F32;
         let vec_h = || TensorShape::vector(h);
         let slab = weights.slab.as_ref();
         let ws = &weights.slices;
 
-        let depth_out = if self.spec.layer_index > 0 {
+        let depth_out = if spec.layer_index > 0 {
             let queries = ws.attn_query.as_ref().ok_or_else(|| {
                 GoldyError::Validation("decoder layer is missing attention_input.query".into())
             })?;
-            let nq = if self.spec.full { 3 } else { 1 };
+            let nq = if spec.full { 3 } else { 1 };
             let depth_out = scheme.temporary_tensor(TensorShape::matrix(nq, h), f)?;
             self.mix(
                 scheme,
@@ -565,9 +679,9 @@ impl DecodeLayer {
 
         if let Some(msgs) = messages {
             let src = |index: u32| -> Result<TensorView<'_>, GoldyError> {
-                if self.spec.layer_index == 0 {
+                if spec.layer_index == 0 {
                     Ok(hidden)
-                } else if self.spec.full {
+                } else if spec.full {
                     row(index)
                 } else {
                     row(0)
@@ -579,30 +693,30 @@ impl DecodeLayer {
             self.gate_into(scheme, src(0)?, msgs[0], ws.q_gate.as_ref(), slab, q)?;
             self.gate_into(scheme, src(1)?, msgs[1], ws.k_gate.as_ref(), slab, k)?;
             self.gate_into(scheme, src(2)?, msgs[2], ws.v_gate.as_ref(), slab, v)?;
-            self.norm_stream(scheme, q, self.q_weight(weights)?, qn)?;
-            self.norm_stream(scheme, k, self.k_weight(weights)?, kn)?;
-            self.norm_stream(scheme, v, self.v_weight(weights)?, vn)?;
+            self.norm_stream(scheme, q, Self::q_weight(spec.full, weights)?, qn)?;
+            self.norm_stream(scheme, k, Self::k_weight(spec.full, weights)?, kn)?;
+            self.norm_stream(scheme, v, Self::v_weight(spec.full, weights)?, vn)?;
             return Ok((qn, kn, vn));
         }
-        if self.spec.layer_index == 0 {
-            if self.spec.full {
-                self.norm_stream(scheme, hidden, self.q_weight(weights)?, qn)?;
-                self.norm_stream(scheme, hidden, self.k_weight(weights)?, kn)?;
-                self.norm_stream(scheme, hidden, self.v_weight(weights)?, vn)?;
+        if spec.layer_index == 0 {
+            if spec.full {
+                self.norm_stream(scheme, hidden, Self::q_weight(true, weights)?, qn)?;
+                self.norm_stream(scheme, hidden, Self::k_weight(true, weights)?, kn)?;
+                self.norm_stream(scheme, hidden, Self::v_weight(true, weights)?, vn)?;
             } else {
-                let w = self.q_weight(weights)?;
+                let w = Self::q_weight(false, weights)?;
                 self.norm_stream(scheme, hidden, w, qn)?;
                 self.norm_stream(scheme, hidden, w, kn)?;
                 self.norm_stream(scheme, hidden, w, vn)?;
             }
             return Ok((qn, kn, vn));
         }
-        if self.spec.full {
-            self.norm_stream(scheme, row(0)?, self.q_weight(weights)?, qn)?;
-            self.norm_stream(scheme, row(1)?, self.k_weight(weights)?, kn)?;
-            self.norm_stream(scheme, row(2)?, self.v_weight(weights)?, vn)?;
+        if spec.full {
+            self.norm_stream(scheme, row(0)?, Self::q_weight(true, weights)?, qn)?;
+            self.norm_stream(scheme, row(1)?, Self::k_weight(true, weights)?, kn)?;
+            self.norm_stream(scheme, row(2)?, Self::v_weight(true, weights)?, vn)?;
         } else {
-            let w = self.q_weight(weights)?;
+            let w = Self::q_weight(false, weights)?;
             let src = row(0)?;
             self.norm_stream(scheme, src, w, qn)?;
             self.norm_stream(scheme, src, w, kn)?;
@@ -611,12 +725,9 @@ impl DecodeLayer {
         Ok((qn, kn, vn))
     }
 
-    fn q_weight<'a>(
-        &'a self,
-        weights: &'a DecodeLayerWeights,
-    ) -> Result<TensorView<'a>, GoldyError> {
+    fn q_weight(full: bool, weights: &DecodeLayerWeights) -> Result<TensorView<'_>, GoldyError> {
         let slab = weights.slab.as_ref();
-        if self.spec.full {
+        if full {
             weights
                 .slices
                 .q_norm
@@ -639,12 +750,9 @@ impl DecodeLayer {
         }
     }
 
-    fn k_weight<'a>(
-        &'a self,
-        weights: &'a DecodeLayerWeights,
-    ) -> Result<TensorView<'a>, GoldyError> {
+    fn k_weight(full: bool, weights: &DecodeLayerWeights) -> Result<TensorView<'_>, GoldyError> {
         let slab = weights.slab.as_ref();
-        if self.spec.full {
+        if full {
             weights
                 .slices
                 .k_norm
@@ -654,16 +762,13 @@ impl DecodeLayer {
                     GoldyError::Validation("full decoder layer is missing k_input_layernorm".into())
                 })
         } else {
-            self.q_weight(weights)
+            Self::q_weight(false, weights)
         }
     }
 
-    fn v_weight<'a>(
-        &'a self,
-        weights: &'a DecodeLayerWeights,
-    ) -> Result<TensorView<'a>, GoldyError> {
+    fn v_weight(full: bool, weights: &DecodeLayerWeights) -> Result<TensorView<'_>, GoldyError> {
         let slab = weights.slab.as_ref();
-        if self.spec.full {
+        if full {
             weights
                 .slices
                 .v_norm
@@ -673,7 +778,7 @@ impl DecodeLayer {
                     GoldyError::Validation("full decoder layer is missing v_input_layernorm".into())
                 })
         } else {
-            self.q_weight(weights)
+            Self::q_weight(false, weights)
         }
     }
 
@@ -712,11 +817,11 @@ impl DecodeLayer {
         slab: &Tensor,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        let h = self.spec.hidden;
+        let h = self.hidden;
         let f = TensorDType::F32;
         let vec_h = || TensorShape::vector(h);
         let cat = scheme.temporary_tensor(TensorShape::matrix(2, h), f)?;
-        let rank = scheme.temporary_tensor(TensorShape::vector(self.spec.gate_rank.max(1)), f)?;
+        let rank = scheme.temporary_tensor(TensorShape::vector(self.gate_rank.max(1)), f)?;
         let forget_logits = scheme.temporary_tensor(vec_h(), f)?;
         let forget = scheme.temporary_tensor(vec_h(), f)?;
         let gate_logits = scheme.temporary_tensor(vec_h(), f)?;
@@ -763,6 +868,51 @@ impl DecodeLayer {
             n_blocks,
             DEPTH_RMS_EPS,
             self.scale,
+        )
+    }
+}
+
+/// Stateless child modules for one standalone decoder layer configuration.
+pub struct DecodeLayer {
+    spec: DecodeLayerSpec,
+    modules: SharedLayerModules,
+}
+
+impl DecodeLayer {
+    pub fn new(
+        runtime: &Runtime,
+        spec: DecodeLayerSpec,
+        scalars: DecodeLayerScalars,
+    ) -> anyhow::Result<Self> {
+        let modules = SharedLayerModules::new(runtime, &[(spec, scalars)])?;
+        Ok(Self { spec, modules })
+    }
+
+    pub fn spec(&self) -> DecodeLayerSpec {
+        self.spec
+    }
+
+    /// Record the layer. `blocks` is `[capacity, hidden]` and the first
+    /// `n_blocks` rows are valid. A boundary layer writes the layer input into
+    /// row `n_blocks` so the MLP mix can see it; that write stays in `blocks`.
+    ///
+    /// `messages`, when this layer was built with them, is query, key, value,
+    /// and MLP, each `[hidden]`. `step.position` is the token position.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &self,
+        scheme: &mut Scheme,
+        hidden: TensorView<'_>,
+        blocks: TensorView<'_>,
+        n_blocks: u32,
+        messages: Option<[TensorView<'_>; 4]>,
+        weights: &DecodeLayerWeights,
+        state: &DecodeLayerState,
+        step: &Buffer,
+        out: TensorView<'_>,
+    ) -> Result<(), GoldyError> {
+        self.modules.record_layer(
+            scheme, self.spec, hidden, blocks, n_blocks, messages, weights, state, step, out,
         )
     }
 }
