@@ -265,9 +265,9 @@ fn decoder_layer_matches_pinned_module_on_replay() {
         // convolutions are cyclic row dots too, and a ring cache store is
         // described as cyclic stores, so it folds into the next projection.
         // Depth mix, split-K, and the tape store stay one dispatch each. The
-        // per-head L2 clips are described up to reassociation, so they fuse
-        // only under relaxed arithmetic. MatchRecorded therefore preserves
-        // four additional clip dispatches.
+        // per-head L2 clips are described up to reassociation. Vulkan fuses
+        // their boundaries only under relaxed arithmetic; Metal's native and
+        // reduction boundaries currently preserve the same node count.
         assert!(has("rms_normalize"), "no fused RMS region: {report:?}");
         assert!(has("msg_forget_h"), "no fused message gate: {report:?}");
         assert!(has("swiglu"), "no fused SwiGLU: {report:?}");
@@ -277,16 +277,14 @@ fn decoder_layer_matches_pinned_module_on_replay() {
                 .iter()
                 .all(|region| matches!(region.status, goldy::FusionRegionStatus::Promoted));
             assert!(promoted, "full visit fusion did not promote: {report:?}");
-            // Metal keeps five native linear dispatches outside generated
-            // algebra regions. The arithmetic-policy delta remains the four
-            // L2 clips above on every backend.
-            let backend_nodes = match device.backend_type() {
-                BackendType::Metal => 36,
-                _ => 31,
-            };
-            let expected_nodes = match ammon::inference_arithmetic_policy().unwrap() {
-                goldy::ArithmeticPolicy::MatchRecorded => backend_nodes + 4,
-                goldy::ArithmeticPolicy::Relaxed => backend_nodes,
+            // Metal keeps native/reduction boundaries that leave this visit at
+            // 40 nodes under both policies. Vulkan's generated path can remove
+            // the four L2-clip boundaries when reassociation is allowed.
+            let policy = ammon::inference_arithmetic_policy().unwrap();
+            let expected_nodes = match (device.backend_type(), policy) {
+                (BackendType::Metal, _) => 40,
+                (_, goldy::ArithmeticPolicy::MatchRecorded) => 35,
+                (_, goldy::ArithmeticPolicy::Relaxed) => 31,
             };
             assert_eq!(recorded.executed_node_count(), expected_nodes, "{report:?}");
             let mut samples = Vec::new();
