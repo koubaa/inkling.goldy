@@ -133,7 +133,15 @@ fn mini_forward_matches_the_reference_logits() {
         stats.clean_submits > 0,
         "token scheme was not clean on replay: {stats:?}"
     );
+    #[cfg(not(feature = "metal"))]
     assert_eq!(stats.retained_evictions, 0, "{stats:?}");
+    #[cfg(feature = "metal")]
+    assert_eq!(
+        stats.retained_evictions,
+        2 * stats.fusion_promotions,
+        "Metal may replace the two retained partitions once when fusion promotes, \
+         but must not churn retained command buffers: {stats:?}"
+    );
 }
 
 fn max_abs(got: &[f32], want: &[f32]) -> f64 {
