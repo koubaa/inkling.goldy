@@ -207,7 +207,13 @@ pub struct DecodeLayer {
     ops: goldy::TensorKernels,
     attn: DecodeAttention,
     moe: DecodeMoe,
-    norm: RmsNorm,
+    /// One RMSNorm per site, so norms that fuse together bind separate scratch.
+    q_rms: RmsNorm,
+    k_rms: RmsNorm,
+    v_rms: RmsNorm,
+    hidden_rms: RmsNorm,
+    message_rms: RmsNorm,
+    post_rms: RmsNorm,
     linear: Linear,
     tanh: Softcap,
     scale: f32,
@@ -262,6 +268,7 @@ impl DecodeLayer {
         };
         let hidden = spec.hidden;
         let h = |n| zeros(runtime, &[n]);
+        let rms = || RmsNorm::with_eps(runtime, hidden, scalars.rms_eps);
         Ok(Self {
             attn: DecodeAttention::new(
                 runtime,
@@ -289,7 +296,12 @@ impl DecodeLayer {
                 scalars.gate_cap,
                 scalars.up_cap,
             )?,
-            norm: RmsNorm::with_eps(runtime, hidden, scalars.rms_eps)?,
+            q_rms: rms()?,
+            k_rms: rms()?,
+            v_rms: rms()?,
+            hidden_rms: rms()?,
+            message_rms: rms()?,
+            post_rms: rms()?,
             linear: Linear::new(runtime)?,
             tanh: Softcap::new(runtime, hidden, 1.0)?,
             depth: DepthMix::new(runtime)?,
@@ -419,7 +431,7 @@ impl DecodeLayer {
         } else {
             mixed
         };
-        self.norm.record(
+        self.post_rms.record(
             scheme,
             mlp_src,
             weights.post_norm.view(),
@@ -508,19 +520,19 @@ impl DecodeLayer {
                 weights.v_gate.as_ref(),
                 self.v.view(),
             )?;
-            self.norm_stream(
+            self.q_rms.record(
                 scheme,
                 self.q.view(),
                 self.q_weight(weights)?,
                 self.qn.view(),
             )?;
-            self.norm_stream(
+            self.k_rms.record(
                 scheme,
                 self.k.view(),
                 self.k_weight(weights)?,
                 self.kn.view(),
             )?;
-            self.norm_stream(
+            self.v_rms.record(
                 scheme,
                 self.v.view(),
                 self.v_weight(weights)?,
@@ -530,31 +542,34 @@ impl DecodeLayer {
         }
         if self.spec.layer_index == 0 {
             if self.spec.full {
-                self.norm_stream(scheme, hidden, self.q_weight(weights)?, self.qn.view())?;
-                self.norm_stream(scheme, hidden, self.k_weight(weights)?, self.kn.view())?;
-                self.norm_stream(scheme, hidden, self.v_weight(weights)?, self.vn.view())?;
+                self.q_rms
+                    .record(scheme, hidden, self.q_weight(weights)?, self.qn.view())?;
+                self.k_rms
+                    .record(scheme, hidden, self.k_weight(weights)?, self.kn.view())?;
+                self.v_rms
+                    .record(scheme, hidden, self.v_weight(weights)?, self.vn.view())?;
             } else {
                 let w = self.q_weight(weights)?;
-                self.norm_stream(scheme, hidden, w, self.qn.view())?;
-                self.norm_stream(scheme, hidden, w, self.kn.view())?;
-                self.norm_stream(scheme, hidden, w, self.vn.view())?;
+                self.q_rms.record(scheme, hidden, w, self.qn.view())?;
+                self.k_rms.record(scheme, hidden, w, self.kn.view())?;
+                self.v_rms.record(scheme, hidden, w, self.vn.view())?;
             }
             return Ok(());
         }
         if self.spec.full {
-            self.norm_stream(
+            self.q_rms.record(
                 scheme,
                 self.row(0)?,
                 self.q_weight(weights)?,
                 self.qn.view(),
             )?;
-            self.norm_stream(
+            self.k_rms.record(
                 scheme,
                 self.row(1)?,
                 self.k_weight(weights)?,
                 self.kn.view(),
             )?;
-            self.norm_stream(
+            self.v_rms.record(
                 scheme,
                 self.row(2)?,
                 self.v_weight(weights)?,
@@ -563,9 +578,9 @@ impl DecodeLayer {
         } else {
             let w = self.q_weight(weights)?;
             let src = self.row(0)?;
-            self.norm_stream(scheme, src, w, self.qn.view())?;
-            self.norm_stream(scheme, src, w, self.kn.view())?;
-            self.norm_stream(scheme, src, w, self.vn.view())?;
+            self.q_rms.record(scheme, src, w, self.qn.view())?;
+            self.k_rms.record(scheme, src, w, self.kn.view())?;
+            self.v_rms.record(scheme, src, w, self.vn.view())?;
         }
         Ok(())
     }
@@ -617,16 +632,6 @@ impl DecodeLayer {
         }
     }
 
-    fn norm_stream(
-        &self,
-        scheme: &mut Scheme,
-        x: TensorView<'_>,
-        weight: TensorView<'_>,
-        out: TensorView<'_>,
-    ) -> Result<(), GoldyError> {
-        self.norm.record(scheme, x, weight, out)
-    }
-
     fn gate_into(
         &self,
         scheme: &mut Scheme,
@@ -649,10 +654,20 @@ impl DecodeLayer {
         gate: &GateWeights,
         out: TensorView<'_>,
     ) -> Result<(), GoldyError> {
-        let hidden_row = self.cat.view().narrow(0, 0, 1)?.reshape(&[self.spec.hidden])?;
-        let message_row = self.cat.view().narrow(0, 1, 1)?.reshape(&[self.spec.hidden])?;
-        self.norm.record_unweighted(scheme, hidden, hidden_row)?;
-        self.norm.record_unweighted(scheme, message, message_row)?;
+        let hidden_row = self
+            .cat
+            .view()
+            .narrow(0, 0, 1)?
+            .reshape(&[self.spec.hidden])?;
+        let message_row = self
+            .cat
+            .view()
+            .narrow(0, 1, 1)?
+            .reshape(&[self.spec.hidden])?;
+        self.hidden_rms
+            .record_unweighted(scheme, hidden, hidden_row)?;
+        self.message_rms
+            .record_unweighted(scheme, message, message_row)?;
         let flat = self.cat.view().reshape(&[self.spec.hidden * 2])?;
         self.linear
             .record(scheme, gate.down.view(), flat, self.rank.view())?;
