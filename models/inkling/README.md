@@ -1,4 +1,4 @@
-# inkling.goldy
+# inkling
 
 Inkling 2 text decoder on [Ammon](https://github.com/Koubaa/Ammon) and [Goldy](https://github.com/koubaa/goldy). The correctness target is FP32 on the Vulkan backend, matched against the Hugging Face transformers reference on random weights. Readable text is not a goal.
 
@@ -9,7 +9,7 @@ Two architectures:
 
 Text only. No vision tower, no multi-token prediction.
 
-This tree holds the Python reference harness and the Rust decoder layer: the checkpoint name map, one decoder layer, and the only depth-tape owner (`src/tape.rs`). Ammon supplies the model-agnostic kernels.
+This directory holds the Python reference harness and the Rust decoder layer: the checkpoint name map, one decoder layer, and the only depth-tape owner (`src/tape.rs`). Ammon supplies the model-agnostic kernels.
 
 ## Reference
 
@@ -26,7 +26,7 @@ Generated weights and activations go to `artifacts/ref/` and are not committed. 
 
 ## Crate
 
-Ammon and Goldy are path dependencies, checked out as siblings of this crate. CI checks Ammon out from main and pins `GOLDY_REF`.
+Ammon and Goldy are workspace path dependencies, checked out as siblings of the repository. CI pins both in [`.github/pins.env`](../../.github/pins.env). Commands run from this directory.
 
 ```bash
 cargo check
