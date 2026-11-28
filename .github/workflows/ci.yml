@@ -84,6 +84,8 @@ jobs:
   inkling-lavapipe:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      AMMON_ARITHMETIC_POLICY: match-recorded
     steps:
       - uses: actions/checkout@v4
         with:
